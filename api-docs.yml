@@ -667,6 +667,7 @@ definitions:
         type: integer
       repository_id:
         type: integer
+        x-nullable: true
       type:
         type: string
         enum: [static, static-yaml, file, terraform-workspace]
