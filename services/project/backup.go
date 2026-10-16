@@ -301,28 +301,37 @@ func (b *BackupDB) format() (*BackupFormat, error) {
 		}
 	}
 
-	schedules := make([]BackupSchedule, len(b.schedules))
-	for i, o := range b.schedules {
+	schedules := make([]BackupSchedule, 0, len(b.schedules))
+	for _, o := range b.schedules {
 
-		tplName, _ := findNameByID[db.Template](o.TemplateID, b.templates)
+		tplName, err := findNameByID[db.Template](o.TemplateID, b.templates)
+		if err != nil {
+			return nil, fmt.Errorf("schedule %q (id %d) references template id %d that is missing from the backup view", o.Name, o.ID, o.TemplateID)
+		}
+
 		var repoName *string
 		if o.RepositoryID != nil {
-			repoName, _ = findNameByID[db.Repository](*o.RepositoryID, b.repositories)
+			repoName, err = findNameByID[db.Repository](*o.RepositoryID, b.repositories)
+			if err != nil {
+				return nil, fmt.Errorf("schedule %q (id %d) references repository id %d that is missing from the backup view", o.Name, o.ID, *o.RepositoryID)
+			}
 		}
 
-		if tplName == nil {
-			continue
-		}
-
-		schedules[i] = BackupSchedule{
+		bs := BackupSchedule{
 			o,
 			*tplName,
 			repoName,
 		}
 
 		if o.TaskParams != nil && o.TaskParams.InventoryID != nil {
-			schedules[i].TaskParams.InventoryName, _ = findNameByID[db.Inventory](*o.TaskParams.InventoryID, b.inventories)
+			invName, err := findNameByID[db.Inventory](*o.TaskParams.InventoryID, b.inventories)
+			if err != nil {
+				return nil, fmt.Errorf("schedule %q (id %d) task parameters reference inventory id %d that is missing from the backup view", o.Name, o.ID, *o.TaskParams.InventoryID)
+			}
+			bs.TaskParams.InventoryName = invName
 		}
+
+		schedules = append(schedules, bs)
 	}
 
 	keys := make([]BackupAccessKey, len(b.keys))
@@ -337,14 +346,22 @@ func (b *BackupDB) format() (*BackupFormat, error) {
 		secretStorages[i] = BackupSecretStorage{
 			SecretStorage: o,
 		}
+	}
 
-		for k := range keys {
-			if keys[k].StorageID != nil && *keys[k].StorageID == o.ID {
-				keys[k].Storage = &o.Name
+	for k := range keys {
+		if keys[k].StorageID != nil {
+			name, err := findNameByID[db.SecretStorage](*keys[k].StorageID, b.secretStorages)
+			if err != nil {
+				return nil, fmt.Errorf("key %q (id %d) references secret storage id %d that is missing from the backup view", keys[k].Name, keys[k].ID, *keys[k].StorageID)
 			}
-			if keys[k].SourceStorageID != nil && *keys[k].SourceStorageID == o.ID {
-				keys[k].SourceStorage = &o.Name
+			keys[k].Storage = name
+		}
+		if keys[k].SourceStorageID != nil {
+			name, err := findNameByID[db.SecretStorage](*keys[k].SourceStorageID, b.secretStorages)
+			if err != nil {
+				return nil, fmt.Errorf("key %q (id %d) references source secret storage id %d that is missing from the backup view", keys[k].Name, keys[k].ID, *keys[k].SourceStorageID)
 			}
+			keys[k].SourceStorage = name
 		}
 	}
 
@@ -359,11 +376,19 @@ func (b *BackupDB) format() (*BackupFormat, error) {
 	for i, o := range b.inventories {
 		var SSHKey *string = nil
 		if o.SSHKeyID != nil {
-			SSHKey, _ = findNameByID[db.AccessKey](*o.SSHKeyID, b.keys)
+			name, err := findNameByID[db.AccessKey](*o.SSHKeyID, b.keys)
+			if err != nil {
+				return nil, fmt.Errorf("inventory %q (id %d) references ssh key id %d that is missing from the backup view", o.Name, o.ID, *o.SSHKeyID)
+			}
+			SSHKey = name
 		}
 		var BecomeKey *string = nil
 		if o.BecomeKeyID != nil {
-			BecomeKey, _ = findNameByID[db.AccessKey](*o.BecomeKeyID, b.keys)
+			name, err := findNameByID[db.AccessKey](*o.BecomeKeyID, b.keys)
+			if err != nil {
+				return nil, fmt.Errorf("inventory %q (id %d) references become key id %d that is missing from the backup view", o.Name, o.ID, *o.BecomeKeyID)
+			}
+			BecomeKey = name
 		}
 		inventories[i] = BackupInventory{
 			Inventory: o,
@@ -381,7 +406,10 @@ func (b *BackupDB) format() (*BackupFormat, error) {
 
 	repositories := make([]BackupRepository, len(b.repositories))
 	for i, o := range b.repositories {
-		SSHKey, _ := findNameByID[db.AccessKey](o.SSHKeyID, b.keys)
+		SSHKey, err := findNameByID[db.AccessKey](o.SSHKeyID, b.keys)
+		if err != nil {
+			return nil, fmt.Errorf("repository %q (id %d) references ssh key id %d that is missing from the backup view", o.Name, o.ID, o.SSHKeyID)
+		}
 		repositories[i] = BackupRepository{
 			Repository: o,
 			SSHKey:     SSHKey,
@@ -390,7 +418,10 @@ func (b *BackupDB) format() (*BackupFormat, error) {
 
 	hostConfigs := make([]BackupHostConfig, len(b.hostConfigs))
 	for i, o := range b.hostConfigs {
-		SSHKey, _ := findNameByID[db.AccessKey](o.SSHKeyID, b.keys)
+		SSHKey, err := findNameByID[db.AccessKey](o.SSHKeyID, b.keys)
+		if err != nil {
+			return nil, fmt.Errorf("host config %q (id %d) references ssh key id %d that is missing from the backup view", o.Name, o.ID, o.SSHKeyID)
+		}
 		hostConfigs[i] = BackupHostConfig{
 			HostConfig: o,
 			SSHKey:     SSHKey,
@@ -401,13 +432,21 @@ func (b *BackupDB) format() (*BackupFormat, error) {
 	for i, o := range b.templates {
 		var View *string = nil
 		if o.ViewID != nil {
-			View, _ = findNameByID[db.View](*o.ViewID, b.views)
+			name, err := findNameByID[db.View](*o.ViewID, b.views)
+			if err != nil {
+				return nil, fmt.Errorf("template %q (id %d) references view id %d that is missing from the backup view", o.Name, o.ID, *o.ViewID)
+			}
+			View = name
 		}
 		var vaults []BackupTemplateVault = nil
 		for _, vault := range o.Vaults {
 			var vaultKey *string = nil
 			if vault.VaultKeyID != nil {
-				vaultKey, _ = findNameByID[db.AccessKey](*vault.VaultKeyID, b.keys)
+				name, err := findNameByID[db.AccessKey](*vault.VaultKeyID, b.keys)
+				if err != nil {
+					return nil, fmt.Errorf("template %q (id %d) vault id %d references key id %d that is missing from the backup view", o.Name, o.ID, vault.ID, *vault.VaultKeyID)
+				}
+				vaultKey = name
 			}
 			vaults = append(vaults, BackupTemplateVault{
 				TemplateVault: vault,
@@ -417,20 +456,32 @@ func (b *BackupDB) format() (*BackupFormat, error) {
 		}
 		var Environments []string
 		for _, envID := range o.EnvironmentIDs {
-			name, _ := findNameByID[db.Environment](envID, b.environments)
-			if name != nil {
-				Environments = append(Environments, *name)
+			name, err := findNameByID[db.Environment](envID, b.environments)
+			if err != nil {
+				return nil, fmt.Errorf("template %q (id %d) references variable group id %d that is missing from the backup view", o.Name, o.ID, envID)
 			}
+			Environments = append(Environments, *name)
 		}
 		var BuildTemplate *string = nil
 		if o.BuildTemplateID != nil {
-			BuildTemplate, _ = findNameByID[db.Template](*o.BuildTemplateID, b.templates)
+			name, err := findNameByID[db.Template](*o.BuildTemplateID, b.templates)
+			if err != nil {
+				return nil, fmt.Errorf("template %q (id %d) references build template id %d that is missing from the backup view", o.Name, o.ID, *o.BuildTemplateID)
+			}
+			BuildTemplate = name
 		}
-		Repository, _ := findNameByID[db.Repository](o.RepositoryID, b.repositories)
+		repositoryName, err := findNameByID[db.Repository](o.RepositoryID, b.repositories)
+		if err != nil {
+			return nil, fmt.Errorf("template %q (id %d) references repository id %d that is missing from the backup view", o.Name, o.ID, o.RepositoryID)
+		}
 
 		var Inventory *string = nil
 		if o.InventoryID != nil {
-			Inventory, _ = findNameByID[db.Inventory](*o.InventoryID, b.inventories)
+			name, err := findNameByID[db.Inventory](*o.InventoryID, b.inventories)
+			if err != nil {
+				return nil, fmt.Errorf("template %q (id %d) references inventory id %d that is missing from the backup view", o.Name, o.ID, *o.InventoryID)
+			}
+			Inventory = name
 		}
 
 		if o.SurveyVarsJSON != nil {
@@ -451,25 +502,26 @@ func (b *BackupDB) format() (*BackupFormat, error) {
 					IsGlobal:    false,
 					Permissions: r.Permissions,
 				})
-			} else {
-				// Try to find in Global
-				name, err = findNameBySlug[db.Role](r.RoleSlug, b.globalRoles)
-				if err != nil {
-					continue
-				}
-
-				roles = append(roles, BackupTemplateRole{
-					Role:        *name,
-					IsGlobal:    true,
-					Permissions: r.Permissions,
-				})
+				continue
 			}
+
+			// Try to find in Global
+			name, err = findNameBySlug[db.Role](r.RoleSlug, b.globalRoles)
+			if err != nil {
+				return nil, fmt.Errorf("template %q (id %d) grants role %q that is missing from both project and global roles in the backup view", o.Name, o.ID, r.RoleSlug)
+			}
+
+			roles = append(roles, BackupTemplateRole{
+				Role:        *name,
+				IsGlobal:    true,
+				Permissions: r.Permissions,
+			})
 		}
 
 		templates[i] = BackupTemplate{
 			Template:      o,
 			View:          View,
-			Repository:    *Repository,
+			Repository:    *repositoryName,
 			Inventory:     Inventory,
 			Environments:  Environments,
 			BuildTemplate: BuildTemplate,
@@ -478,8 +530,8 @@ func (b *BackupDB) format() (*BackupFormat, error) {
 		}
 	}
 
-	integrations := make([]BackupIntegration, len(b.integrations))
-	for i, o := range b.integrations {
+	integrations := make([]BackupIntegration, 0, len(b.integrations))
+	for _, o := range b.integrations {
 
 		var aliases []string
 
@@ -487,19 +539,21 @@ func (b *BackupDB) format() (*BackupFormat, error) {
 			aliases = append(aliases, a.Alias)
 		}
 
-		tplName, _ := findNameByID[db.Template](o.TemplateID, b.templates)
-
-		if tplName == nil {
-			continue
+		tplName, err := findNameByID[db.Template](o.TemplateID, b.templates)
+		if err != nil {
+			return nil, fmt.Errorf("integration %q (id %d) references template id %d that is missing from the backup view", o.Name, o.ID, o.TemplateID)
 		}
 
 		var keyName *string
 
 		if o.AuthSecretID != nil {
-			keyName, _ = findNameByID[db.AccessKey](*o.AuthSecretID, b.keys)
+			keyName, err = findNameByID[db.AccessKey](*o.AuthSecretID, b.keys)
+			if err != nil {
+				return nil, fmt.Errorf("integration %q (id %d) references auth key id %d that is missing from the backup view", o.Name, o.ID, *o.AuthSecretID)
+			}
 		}
 
-		integrations[i] = BackupIntegration{
+		bi := BackupIntegration{
 			Integration:   o,
 			Aliases:       aliases,
 			Matchers:      b.integrationMatchers[o.ID],
@@ -509,8 +563,14 @@ func (b *BackupDB) format() (*BackupFormat, error) {
 		}
 
 		if o.TaskParams != nil && o.TaskParams.InventoryID != nil {
-			integrations[i].TaskParams.InventoryName, _ = findNameByID[db.Inventory](*o.TaskParams.InventoryID, b.inventories)
+			invName, err := findNameByID[db.Inventory](*o.TaskParams.InventoryID, b.inventories)
+			if err != nil {
+				return nil, fmt.Errorf("integration %q (id %d) task parameters reference inventory id %d that is missing from the backup view", o.Name, o.ID, *o.TaskParams.InventoryID)
+			}
+			bi.TaskParams.InventoryName = invName
 		}
+
+		integrations = append(integrations, bi)
 	}
 
 	var integrationAliases []string
@@ -534,10 +594,18 @@ func (b *BackupDB) format() (*BackupFormat, error) {
 				WorkflowNode: n,
 			}
 			if n.TemplateID != 0 {
-				node.Template, _ = findNameByID[db.Template](n.TemplateID, b.templates)
+				tplName, err := findNameByID[db.Template](n.TemplateID, b.templates)
+				if err != nil {
+					return nil, fmt.Errorf("workflow %q (id %d) node %d references template id %d that is missing from the backup view", o.Name, o.ID, n.ID, n.TemplateID)
+				}
+				node.Template = tplName
 			}
 			if n.TaskParams != nil && n.TaskParams.InventoryID != nil {
-				node.TaskParams.InventoryName, _ = findNameByID[db.Inventory](*n.TaskParams.InventoryID, b.inventories)
+				invName, err := findNameByID[db.Inventory](*n.TaskParams.InventoryID, b.inventories)
+				if err != nil {
+					return nil, fmt.Errorf("workflow %q (id %d) node %d task parameters reference inventory id %d that is missing from the backup view", o.Name, o.ID, n.ID, *n.TaskParams.InventoryID)
+				}
+				node.TaskParams.InventoryName = invName
 			}
 			nodes[j] = node
 		}
@@ -568,11 +636,56 @@ func (b *BackupDB) format() (*BackupFormat, error) {
 	}, nil
 }
 
+// backupLoadAttempts bounds how many times a failed export view is discarded
+// and reloaded. A retry is cheap: with a read snapshot the common cause is a
+// concurrent commit racing the snapshot start, which the next attempt cannot
+// see anymore.
+const backupLoadAttempts = 3
+
+// GetBackup builds one exportable project backup. All entities — the project
+// metadata, templates with their vaults and roles, repositories, host
+// configs, credentials, views, inventories, variable groups, schedules with
+// their task parameters, external secret stores, integrations with aliases
+// and matching rules, project roles and runners — are read from a single
+// read-only database snapshot, so the result always equals one committed
+// project state even while other members edit the project.
+//
+// If a consistent view cannot be taken, a read fails, or a required name
+// reference cannot be resolved inside the view, the attempt is discarded and a
+// fresh view is taken. Only a fully consistent backup is returned; the caller
+// therefore never writes a partial file or records a successful export.
 func GetBackup(projectID int, store db.Store, workflowStore db.WorkflowManager) (*BackupFormat, error) {
-	backup := BackupDB{}
-	if err := backup.load(projectID, store, workflowStore); err != nil {
-		return nil, err
+	var lastErr error
+
+	for range backupLoadAttempts {
+		backup, err := getBackupOnce(projectID, store, workflowStore)
+		if err == nil {
+			return backup, nil
+		}
+		lastErr = err
 	}
+
+	return nil, fmt.Errorf("could not obtain a consistent project backup after %d attempts: %w", backupLoadAttempts, lastErr)
+}
+
+func getBackupOnce(projectID int, store db.Store, workflowStore db.WorkflowManager) (*BackupFormat, error) {
+	backup := BackupDB{}
+
+	if snapshotStore, ok := store.(db.ReadSnapshotStore); ok {
+		if err := snapshotStore.WithReadSnapshot(func(view db.Store) error {
+			return backup.load(projectID, view, workflowStore)
+		}); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := backup.load(projectID, store, workflowStore); err != nil {
+			return nil, err
+		}
+	}
+
+	// Resolving every name reference is done against the in-memory view just
+	// loaded; a failure means the view was not internally consistent and the
+	// caller discards it and retries.
 	return backup.format()
 }
 

@@ -584,6 +584,18 @@ type RoleRepository interface {
 	DeleteRole(slug string, projectID *int) error
 }
 
+// ReadSnapshotStore is implemented by stores that can serve a sequence of reads
+// against one immutable, read-only transaction snapshot. The project backup uses
+// it so every entity in an export is taken from the same committed project
+// state while other users may be editing the project concurrently.
+type ReadSnapshotStore interface {
+	// WithReadSnapshot runs fn against a Store whose reads all share a single
+	// consistent snapshot established before fn runs. The snapshot is released
+	// (committed) when fn succeeds and rolled back when it fails. The view Store
+	// must only be used for reads; writes through it are forbidden (read-only).
+	WithReadSnapshot(fn func(view Store) error) error
+}
+
 // Store is the main interface that aggregates all specialized interfaces
 type Store interface {
 	ConnectionManager

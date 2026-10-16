@@ -62,6 +62,12 @@ only when the task touches that topic. Keep this file under 150 lines.
 - `PUT /project/{p}/templates/{id}` with no `vaults` field deletes the template's vaults, and the
   `GET /templates` list omits `vaults` — re-read a template by id before updating it from a script
   (`db/sql/template_vault.go UpdateTemplateVaults`, seen 2026-10-10).
+- Project backup consistency (2026-10-15): `GetBackup` reads every entity inside one read-only
+  REPEATABLE READ snapshot via `db.ReadSnapshotStore` / `SqlDb.WithReadSnapshot` (MySQL forbids
+  `SET TRANSACTION` inside a tx, so it starts through the driver's `BeginTx` wrapped into gorp with
+  unsafe; SQLite is nil-opts, single conn). `BackupDB.format()` must hard-fail on any unresolved
+  reference — never reintroduce `_ =` name lookups or `continue` (zero-valued slice slots); GetBackup
+  retries the whole view 3×. Import `Verify`/`Restore` JSON shape is unchanged.
 - Pre-2026-09-27 plan, task and research-digest files (`AGENTS/plans/…`, `AGENTS/tasks/…`,
   `AGENTS/research/*.md`) cited as sources in `AGENTS/work/` docs were removed from the tree; read them
   with `git show 539d98ad:<path>`. Some plans exist only on feature branches (`feat/cyberark-secret-storage`,

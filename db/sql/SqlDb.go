@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"context"
 	"database/sql"
 	"embed"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/Masterminds/squirrel"
 	"github.com/go-gorp/gorp/v3"
@@ -25,6 +27,22 @@ import (
 type SqlDbConnection struct {
 	sql     *gorp.DbMap
 	dialect string
+
+	// tx is non-nil only on snapshot clones created for WithReadSnapshot. When
+	// set, the read helpers (and Exec) run inside this transaction instead of
+	// autocommit, so every query of one clone sees the same snapshot. The
+	// original store used by the application always leaves this nil. Insert
+	// intentionally does not route here: a snapshot view is read-only.
+	tx *gorp.Transaction
+}
+
+// executor returns the gorp executor every query must run against. On a
+// snapshot clone it is the open transaction; everywhere else it is the pool.
+func (d *SqlDbConnection) executor() gorp.SqlExecutor {
+	if d.tx != nil {
+		return d.tx
+	}
+	return d.sql
 }
 
 type SqlDb struct {
@@ -246,6 +264,50 @@ func (d *SqlDbConnection) Begin() (*gorp.Transaction, error) {
 	return d.sql.Begin()
 }
 
+// beginReadSnapshot opens the transaction behind a read snapshot. MySQL and
+// PostgreSQL start a REPEATABLE READ, READ ONLY transaction through the
+// driver's BeginTx (the MySQL driver issues the isolation characteristic
+// before BEGIN, where MySQL accepts it, and then START TRANSACTION READ ONLY;
+// plain SET TRANSACTION is forbidden inside a running MySQL transaction).
+// SQLite has one connection, so a plain transaction already observes one
+// stable WAL snapshot; it does not understand READ ONLY.
+func (d *SqlDbConnection) beginReadSnapshot() (*gorp.Transaction, error) {
+	var opts *sql.TxOptions
+	switch d.dialect {
+	case util.DbDriverMySQL, util.DbDriverPostgres:
+		opts = &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true}
+	}
+
+	sqlTx, err := d.sql.Db.BeginTx(context.Background(), opts)
+	if err != nil {
+		return nil, err
+	}
+
+	return wrapGorpTransaction(d.sql, sqlTx), nil
+}
+
+// wrapGorpTransaction binds an externally started *sql.Tx into a
+// gorp.Transaction. gorp v3 exposes no constructor accepting sql.TxOptions,
+// so the two private links the wrapper needs — its DbMap (dialect and hooks)
+// and the driver transaction — are linked directly. The result behaves like a
+// transaction returned by DbMap.Begin (nil context, not closed), and every
+// read-snapshot test on SQLite exercises this wrapping.
+func wrapGorpTransaction(m *gorp.DbMap, sqlTx *sql.Tx) *gorp.Transaction {
+	t := &gorp.Transaction{}
+	elem := reflect.ValueOf(t).Elem()
+
+	setPrivate := func(name string, value any) {
+		field := elem.FieldByName(name)
+		reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).
+			Elem().Set(reflect.ValueOf(value))
+	}
+
+	setPrivate("dbmap", m)
+	setPrivate("tx", sqlTx)
+
+	return t
+}
+
 // InsertTx is Insert inside a transaction: it returns the generated primary
 // key on every dialect (Postgres through "returning", the rest through
 // LastInsertId).
@@ -284,7 +346,7 @@ func (d *SqlDbConnection) InsertTx(tx *gorp.Transaction, primaryKeyColumnName st
 
 func (d *SqlDbConnection) Exec(query string, args ...any) (sql.Result, error) {
 	q := d.PrepareQuery(query)
-	return d.sql.Exec(q, args...)
+	return d.executor().Exec(q, args...)
 }
 
 func (d *SqlDbConnection) ExecTx(tx *gorp.Transaction, query string, args ...any) (sql.Result, error) {
@@ -293,7 +355,7 @@ func (d *SqlDbConnection) ExecTx(tx *gorp.Transaction, query string, args ...any
 }
 
 func (d *SqlDbConnection) SelectOne(holder any, query string, args ...any) error {
-	err := d.sql.SelectOne(holder, d.PrepareQuery(query), args...)
+	err := d.executor().SelectOne(holder, d.PrepareQuery(query), args...)
 
 	if errors.Is(err, sql.ErrNoRows) {
 		err = db.ErrNotFound
@@ -304,7 +366,7 @@ func (d *SqlDbConnection) SelectOne(holder any, query string, args ...any) error
 
 func (d *SqlDbConnection) SelectAll(i any, query string, args ...any) ([]any, error) {
 	q := d.PrepareQuery(query)
-	return d.sql.Select(i, q, args...)
+	return d.executor().Select(i, q, args...)
 }
 
 func (d *SqlDbConnection) DeleteObject(projectID int, props db.ObjectProps, objectID any) error {
@@ -417,6 +479,45 @@ func (d *SqlDb) GetDialect() string {
 	return d.connection.GetDialect()
 }
 
+// WithReadSnapshot runs fn against a read-only store whose every query is
+// served from one database transaction. All statements in fn see the same
+// committed snapshot: concurrent renames, deletes or relationship rebinds
+// committed by other connections while fn runs are invisible to it, so an
+// export can never mix an old parent row with new child rows.
+//
+// MySQL/InnoDB and PostgreSQL run the transaction at REPEATABLE READ; SQLite
+// is fully serialised through its single connection. The transaction is READ
+// ONLY on the client/server databases, so an accidental write through the view
+// fails instead of leaking out half-committed. It commits when fn succeeds and
+// rolls back otherwise.
+func (d *SqlDb) WithReadSnapshot(fn func(view db.Store) error) (err error) {
+	tx, err := d.connection.beginReadSnapshot()
+	if err != nil {
+		return err
+	}
+
+	committed := false
+	defer func() {
+		if !committed {
+			handleRollbackError(tx.Rollback())
+		}
+	}()
+
+	snapshot := &SqlDb{connection: d.connection}
+	snapshot.connection.tx = tx
+
+	if err = fn(snapshot); err != nil {
+		return err
+	}
+
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+
+	committed = true
+	return nil
+}
+
 func (d *SqlDb) Close() {
 	d.connection.Close()
 }
@@ -511,13 +612,7 @@ func (d *SqlDb) execTx(tx *gorp.Transaction, query string, args ...any) (sql.Res
 }
 
 func (d *SqlDb) selectOne(holder any, query string, args ...any) error {
-	err := d.Sql().SelectOne(holder, d.PrepareQuery(query), args...)
-
-	if errors.Is(err, sql.ErrNoRows) {
-		err = db.ErrNotFound
-	}
-
-	return err
+	return d.connection.SelectOne(holder, query, args...)
 }
 
 func (d *SqlDb) selectAll(i any, query string, args ...any) ([]any, error) {

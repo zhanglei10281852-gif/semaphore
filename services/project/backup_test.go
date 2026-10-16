@@ -575,6 +575,105 @@ func TestRestore_RejectsInvalidHostConfig(t *testing.T) {
 	})
 }
 
+// A backup view that stitched together different committed states (an old
+// parent with a deleted child, or a rebind landing half way through the reads)
+// must never be exported. format() resolves every foreign reference inside the
+// in-memory view by name and fails instead of silently dropping it; GetBackup
+// then discards the attempt.
+func TestBackupFormat_RejectsInconsistentView(t *testing.T) {
+	intPtr := func(v int) *int { return &v }
+
+	tests := []struct {
+		name       string
+		backup     BackupDB
+		errContain string
+	}{
+		{
+			name: "template references deleted repository",
+			backup: BackupDB{
+				templates: []db.Template{{ID: 1, Name: "T", RepositoryID: 99, Playbook: "x.yml"}},
+			},
+			errContain: "repository",
+		},
+		{
+			name: "schedule references deleted template",
+			backup: BackupDB{
+				schedules: []db.Schedule{{ID: 1, Name: "S", TemplateID: 99, CronFormat: "* * * * *"}},
+			},
+			errContain: "template",
+		},
+		{
+			name: "integration references deleted template",
+			backup: BackupDB{
+				integrationAliases:       map[int][]db.IntegrationAlias{},
+				integrationMatchers:      map[int][]db.IntegrationMatcher{},
+				integrationExtractValues: map[int][]db.IntegrationExtractValue{},
+				integrations:             []db.Integration{{ID: 1, Name: "I", TemplateID: 99}},
+			},
+			errContain: "template",
+		},
+		{
+			name: "template references deleted variable group",
+			backup: BackupDB{
+				repositories: []db.Repository{{ID: 1, Name: "R", SSHKeyID: 1}},
+				keys:         []db.AccessKey{{ID: 1, Name: "K", Type: db.AccessKeyNone}},
+				templates: []db.Template{{
+					ID: 1, Name: "T", RepositoryID: 1, Playbook: "x.yml",
+					EnvironmentIDs: []int{40},
+				}},
+			},
+			errContain: "variable group",
+		},
+		{
+			name: "template vault references deleted key",
+			backup: BackupDB{
+				repositories: []db.Repository{{ID: 1, Name: "R", SSHKeyID: 1}},
+				keys:         []db.AccessKey{{ID: 1, Name: "K", Type: db.AccessKeyNone}},
+				templates: []db.Template{{
+					ID: 1, Name: "T", RepositoryID: 1, Playbook: "x.yml",
+					Vaults: []db.TemplateVault{{ID: 1, Type: db.TemplateVaultPassword, VaultKeyID: intPtr(33)}},
+				}},
+			},
+			errContain: "vault",
+		},
+		{
+			name: "repository references deleted ssh key",
+			backup: BackupDB{
+				repositories: []db.Repository{{ID: 1, Name: "R", SSHKeyID: 50}},
+			},
+			errContain: "ssh key",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.backup.meta = db.Project{ID: 1, Name: "P"}
+			_, err := tt.backup.format()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.errContain)
+		})
+	}
+}
+
+// A consistent view formats without error and every name it carries passes the
+// same preflight an imported backup goes through — a successful export file is
+// always restorable.
+func TestBackupFormat_ConsistentViewPassesPreflight(t *testing.T) {
+	b := BackupDB{
+		meta:         db.Project{ID: 1, Name: "P"},
+		keys:         []db.AccessKey{{ID: 1, Name: "K", Type: db.AccessKeyNone}},
+		repositories: []db.Repository{{ID: 1, Name: "R", SSHKeyID: 1}},
+		templates:    []db.Template{{ID: 1, Name: "T", RepositoryID: 1, Playbook: "x.yml"}},
+		schedules: []db.Schedule{{
+			ID: 1, Name: "S", TemplateID: 1, CronFormat: "0 0 * * *",
+		}},
+	}
+
+	formatted, err := b.format()
+	require.NoError(t, err)
+	require.NoError(t, formatted.Verify())
+}
+
 // Old backups may carry bits the application never checks: restore keeps the roles and drops the bits.
 func TestRestore_DropsUnknownPermissionBits(t *testing.T) {
 	util.Config = &util.ConfigType{TmpPath: "/tmp"}

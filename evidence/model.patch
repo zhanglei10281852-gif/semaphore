@@ -1,0 +1,695 @@
+diff --git a/AGENTS/memory/MEMORY.md b/AGENTS/memory/MEMORY.md
+index 26ee8058..a1690056 100644
+--- a/AGENTS/memory/MEMORY.md
++++ b/AGENTS/memory/MEMORY.md
+@@ -62,6 +62,12 @@ only when the task touches that topic. Keep this file under 150 lines.
+ - `PUT /project/{p}/templates/{id}` with no `vaults` field deletes the template's vaults, and the
+   `GET /templates` list omits `vaults` — re-read a template by id before updating it from a script
+   (`db/sql/template_vault.go UpdateTemplateVaults`, seen 2026-10-10).
++- Project backup consistency (2026-10-15): `GetBackup` reads every entity inside one read-only
++  REPEATABLE READ snapshot via `db.ReadSnapshotStore` / `SqlDb.WithReadSnapshot` (MySQL forbids
++  `SET TRANSACTION` inside a tx, so it starts through the driver's `BeginTx` wrapped into gorp with
++  unsafe; SQLite is nil-opts, single conn). `BackupDB.format()` must hard-fail on any unresolved
++  reference — never reintroduce `_ =` name lookups or `continue` (zero-valued slice slots); GetBackup
++  retries the whole view 3×. Import `Verify`/`Restore` JSON shape is unchanged.
+ - Pre-2026-09-27 plan, task and research-digest files (`AGENTS/plans/…`, `AGENTS/tasks/…`,
+   `AGENTS/research/*.md`) cited as sources in `AGENTS/work/` docs were removed from the tree; read them
+   with `git show 539d98ad:<path>`. Some plans exist only on feature branches (`feat/cyberark-secret-storage`,
+diff --git a/db/Store.go b/db/Store.go
+index fec4e931..afc424c4 100644
+--- a/db/Store.go
++++ b/db/Store.go
+@@ -584,6 +584,18 @@ type RoleRepository interface {
+ 	DeleteRole(slug string, projectID *int) error
+ }
+ 
++// ReadSnapshotStore is implemented by stores that can serve a sequence of reads
++// against one immutable, read-only transaction snapshot. The project backup uses
++// it so every entity in an export is taken from the same committed project
++// state while other users may be editing the project concurrently.
++type ReadSnapshotStore interface {
++	// WithReadSnapshot runs fn against a Store whose reads all share a single
++	// consistent snapshot established before fn runs. The snapshot is released
++	// (committed) when fn succeeds and rolled back when it fails. The view Store
++	// must only be used for reads; writes through it are forbidden (read-only).
++	WithReadSnapshot(fn func(view Store) error) error
++}
++
+ // Store is the main interface that aggregates all specialized interfaces
+ type Store interface {
+ 	ConnectionManager
+diff --git a/db/sql/SqlDb.go b/db/sql/SqlDb.go
+index bc494325..fa7a6771 100644
+--- a/db/sql/SqlDb.go
++++ b/db/sql/SqlDb.go
+@@ -1,6 +1,7 @@
+ package sql
+ 
+ import (
++	"context"
+ 	"database/sql"
+ 	"embed"
+ 	"errors"
+@@ -10,6 +11,7 @@ import (
+ 	"strconv"
+ 	"strings"
+ 	"time"
++	"unsafe"
+ 
+ 	"github.com/Masterminds/squirrel"
+ 	"github.com/go-gorp/gorp/v3"
+@@ -25,6 +27,22 @@ import (
+ type SqlDbConnection struct {
+ 	sql     *gorp.DbMap
+ 	dialect string
++
++	// tx is non-nil only on snapshot clones created for WithReadSnapshot. When
++	// set, the read helpers (and Exec) run inside this transaction instead of
++	// autocommit, so every query of one clone sees the same snapshot. The
++	// original store used by the application always leaves this nil. Insert
++	// intentionally does not route here: a snapshot view is read-only.
++	tx *gorp.Transaction
++}
++
++// executor returns the gorp executor every query must run against. On a
++// snapshot clone it is the open transaction; everywhere else it is the pool.
++func (d *SqlDbConnection) executor() gorp.SqlExecutor {
++	if d.tx != nil {
++		return d.tx
++	}
++	return d.sql
+ }
+ 
+ type SqlDb struct {
+@@ -246,6 +264,50 @@ func (d *SqlDbConnection) Begin() (*gorp.Transaction, error) {
+ 	return d.sql.Begin()
+ }
+ 
++// beginReadSnapshot opens the transaction behind a read snapshot. MySQL and
++// PostgreSQL start a REPEATABLE READ, READ ONLY transaction through the
++// driver's BeginTx (the MySQL driver issues the isolation characteristic
++// before BEGIN, where MySQL accepts it, and then START TRANSACTION READ ONLY;
++// plain SET TRANSACTION is forbidden inside a running MySQL transaction).
++// SQLite has one connection, so a plain transaction already observes one
++// stable WAL snapshot; it does not understand READ ONLY.
++func (d *SqlDbConnection) beginReadSnapshot() (*gorp.Transaction, error) {
++	var opts *sql.TxOptions
++	switch d.dialect {
++	case util.DbDriverMySQL, util.DbDriverPostgres:
++		opts = &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true}
++	}
++
++	sqlTx, err := d.sql.Db.BeginTx(context.Background(), opts)
++	if err != nil {
++		return nil, err
++	}
++
++	return wrapGorpTransaction(d.sql, sqlTx), nil
++}
++
++// wrapGorpTransaction binds an externally started *sql.Tx into a
++// gorp.Transaction. gorp v3 exposes no constructor accepting sql.TxOptions,
++// so the two private links the wrapper needs — its DbMap (dialect and hooks)
++// and the driver transaction — are linked directly. The result behaves like a
++// transaction returned by DbMap.Begin (nil context, not closed), and every
++// read-snapshot test on SQLite exercises this wrapping.
++func wrapGorpTransaction(m *gorp.DbMap, sqlTx *sql.Tx) *gorp.Transaction {
++	t := &gorp.Transaction{}
++	elem := reflect.ValueOf(t).Elem()
++
++	setPrivate := func(name string, value any) {
++		field := elem.FieldByName(name)
++		reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).
++			Elem().Set(reflect.ValueOf(value))
++	}
++
++	setPrivate("dbmap", m)
++	setPrivate("tx", sqlTx)
++
++	return t
++}
++
+ // InsertTx is Insert inside a transaction: it returns the generated primary
+ // key on every dialect (Postgres through "returning", the rest through
+ // LastInsertId).
+@@ -284,7 +346,7 @@ func (d *SqlDbConnection) InsertTx(tx *gorp.Transaction, primaryKeyColumnName st
+ 
+ func (d *SqlDbConnection) Exec(query string, args ...any) (sql.Result, error) {
+ 	q := d.PrepareQuery(query)
+-	return d.sql.Exec(q, args...)
++	return d.executor().Exec(q, args...)
+ }
+ 
+ func (d *SqlDbConnection) ExecTx(tx *gorp.Transaction, query string, args ...any) (sql.Result, error) {
+@@ -293,7 +355,7 @@ func (d *SqlDbConnection) ExecTx(tx *gorp.Transaction, query string, args ...any
+ }
+ 
+ func (d *SqlDbConnection) SelectOne(holder any, query string, args ...any) error {
+-	err := d.sql.SelectOne(holder, d.PrepareQuery(query), args...)
++	err := d.executor().SelectOne(holder, d.PrepareQuery(query), args...)
+ 
+ 	if errors.Is(err, sql.ErrNoRows) {
+ 		err = db.ErrNotFound
+@@ -304,7 +366,7 @@ func (d *SqlDbConnection) SelectOne(holder any, query string, args ...any) error
+ 
+ func (d *SqlDbConnection) SelectAll(i any, query string, args ...any) ([]any, error) {
+ 	q := d.PrepareQuery(query)
+-	return d.sql.Select(i, q, args...)
++	return d.executor().Select(i, q, args...)
+ }
+ 
+ func (d *SqlDbConnection) DeleteObject(projectID int, props db.ObjectProps, objectID any) error {
+@@ -417,6 +479,45 @@ func (d *SqlDb) GetDialect() string {
+ 	return d.connection.GetDialect()
+ }
+ 
++// WithReadSnapshot runs fn against a read-only store whose every query is
++// served from one database transaction. All statements in fn see the same
++// committed snapshot: concurrent renames, deletes or relationship rebinds
++// committed by other connections while fn runs are invisible to it, so an
++// export can never mix an old parent row with new child rows.
++//
++// MySQL/InnoDB and PostgreSQL run the transaction at REPEATABLE READ; SQLite
++// is fully serialised through its single connection. The transaction is READ
++// ONLY on the client/server databases, so an accidental write through the view
++// fails instead of leaking out half-committed. It commits when fn succeeds and
++// rolls back otherwise.
++func (d *SqlDb) WithReadSnapshot(fn func(view db.Store) error) (err error) {
++	tx, err := d.connection.beginReadSnapshot()
++	if err != nil {
++		return err
++	}
++
++	committed := false
++	defer func() {
++		if !committed {
++			handleRollbackError(tx.Rollback())
++		}
++	}()
++
++	snapshot := &SqlDb{connection: d.connection}
++	snapshot.connection.tx = tx
++
++	if err = fn(snapshot); err != nil {
++		return err
++	}
++
++	if err = tx.Commit(); err != nil {
++		return err
++	}
++
++	committed = true
++	return nil
++}
++
+ func (d *SqlDb) Close() {
+ 	d.connection.Close()
+ }
+@@ -511,13 +612,7 @@ func (d *SqlDb) execTx(tx *gorp.Transaction, query string, args ...any) (sql.Res
+ }
+ 
+ func (d *SqlDb) selectOne(holder any, query string, args ...any) error {
+-	err := d.Sql().SelectOne(holder, d.PrepareQuery(query), args...)
+-
+-	if errors.Is(err, sql.ErrNoRows) {
+-		err = db.ErrNotFound
+-	}
+-
+-	return err
++	return d.connection.SelectOne(holder, query, args...)
+ }
+ 
+ func (d *SqlDb) selectAll(i any, query string, args ...any) ([]any, error) {
+diff --git a/services/project/backup.go b/services/project/backup.go
+index 0f29c11f..8a844946 100644
+--- a/services/project/backup.go
++++ b/services/project/backup.go
+@@ -301,28 +301,37 @@ func (b *BackupDB) format() (*BackupFormat, error) {
+ 		}
+ 	}
+ 
+-	schedules := make([]BackupSchedule, len(b.schedules))
+-	for i, o := range b.schedules {
++	schedules := make([]BackupSchedule, 0, len(b.schedules))
++	for _, o := range b.schedules {
+ 
+-		tplName, _ := findNameByID[db.Template](o.TemplateID, b.templates)
+-		var repoName *string
+-		if o.RepositoryID != nil {
+-			repoName, _ = findNameByID[db.Repository](*o.RepositoryID, b.repositories)
++		tplName, err := findNameByID[db.Template](o.TemplateID, b.templates)
++		if err != nil {
++			return nil, fmt.Errorf("schedule %q (id %d) references template id %d that is missing from the backup view", o.Name, o.ID, o.TemplateID)
+ 		}
+ 
+-		if tplName == nil {
+-			continue
++		var repoName *string
++		if o.RepositoryID != nil {
++			repoName, err = findNameByID[db.Repository](*o.RepositoryID, b.repositories)
++			if err != nil {
++				return nil, fmt.Errorf("schedule %q (id %d) references repository id %d that is missing from the backup view", o.Name, o.ID, *o.RepositoryID)
++			}
+ 		}
+ 
+-		schedules[i] = BackupSchedule{
++		bs := BackupSchedule{
+ 			o,
+ 			*tplName,
+ 			repoName,
+ 		}
+ 
+ 		if o.TaskParams != nil && o.TaskParams.InventoryID != nil {
+-			schedules[i].TaskParams.InventoryName, _ = findNameByID[db.Inventory](*o.TaskParams.InventoryID, b.inventories)
++			invName, err := findNameByID[db.Inventory](*o.TaskParams.InventoryID, b.inventories)
++			if err != nil {
++				return nil, fmt.Errorf("schedule %q (id %d) task parameters reference inventory id %d that is missing from the backup view", o.Name, o.ID, *o.TaskParams.InventoryID)
++			}
++			bs.TaskParams.InventoryName = invName
+ 		}
++
++		schedules = append(schedules, bs)
+ 	}
+ 
+ 	keys := make([]BackupAccessKey, len(b.keys))
+@@ -337,14 +346,22 @@ func (b *BackupDB) format() (*BackupFormat, error) {
+ 		secretStorages[i] = BackupSecretStorage{
+ 			SecretStorage: o,
+ 		}
++	}
+ 
+-		for k := range keys {
+-			if keys[k].StorageID != nil && *keys[k].StorageID == o.ID {
+-				keys[k].Storage = &o.Name
++	for k := range keys {
++		if keys[k].StorageID != nil {
++			name, err := findNameByID[db.SecretStorage](*keys[k].StorageID, b.secretStorages)
++			if err != nil {
++				return nil, fmt.Errorf("key %q (id %d) references secret storage id %d that is missing from the backup view", keys[k].Name, keys[k].ID, *keys[k].StorageID)
+ 			}
+-			if keys[k].SourceStorageID != nil && *keys[k].SourceStorageID == o.ID {
+-				keys[k].SourceStorage = &o.Name
++			keys[k].Storage = name
++		}
++		if keys[k].SourceStorageID != nil {
++			name, err := findNameByID[db.SecretStorage](*keys[k].SourceStorageID, b.secretStorages)
++			if err != nil {
++				return nil, fmt.Errorf("key %q (id %d) references source secret storage id %d that is missing from the backup view", keys[k].Name, keys[k].ID, *keys[k].SourceStorageID)
+ 			}
++			keys[k].SourceStorage = name
+ 		}
+ 	}
+ 
+@@ -359,11 +376,19 @@ func (b *BackupDB) format() (*BackupFormat, error) {
+ 	for i, o := range b.inventories {
+ 		var SSHKey *string = nil
+ 		if o.SSHKeyID != nil {
+-			SSHKey, _ = findNameByID[db.AccessKey](*o.SSHKeyID, b.keys)
++			name, err := findNameByID[db.AccessKey](*o.SSHKeyID, b.keys)
++			if err != nil {
++				return nil, fmt.Errorf("inventory %q (id %d) references ssh key id %d that is missing from the backup view", o.Name, o.ID, *o.SSHKeyID)
++			}
++			SSHKey = name
+ 		}
+ 		var BecomeKey *string = nil
+ 		if o.BecomeKeyID != nil {
+-			BecomeKey, _ = findNameByID[db.AccessKey](*o.BecomeKeyID, b.keys)
++			name, err := findNameByID[db.AccessKey](*o.BecomeKeyID, b.keys)
++			if err != nil {
++				return nil, fmt.Errorf("inventory %q (id %d) references become key id %d that is missing from the backup view", o.Name, o.ID, *o.BecomeKeyID)
++			}
++			BecomeKey = name
+ 		}
+ 		inventories[i] = BackupInventory{
+ 			Inventory: o,
+@@ -381,7 +406,10 @@ func (b *BackupDB) format() (*BackupFormat, error) {
+ 
+ 	repositories := make([]BackupRepository, len(b.repositories))
+ 	for i, o := range b.repositories {
+-		SSHKey, _ := findNameByID[db.AccessKey](o.SSHKeyID, b.keys)
++		SSHKey, err := findNameByID[db.AccessKey](o.SSHKeyID, b.keys)
++		if err != nil {
++			return nil, fmt.Errorf("repository %q (id %d) references ssh key id %d that is missing from the backup view", o.Name, o.ID, o.SSHKeyID)
++		}
+ 		repositories[i] = BackupRepository{
+ 			Repository: o,
+ 			SSHKey:     SSHKey,
+@@ -390,7 +418,10 @@ func (b *BackupDB) format() (*BackupFormat, error) {
+ 
+ 	hostConfigs := make([]BackupHostConfig, len(b.hostConfigs))
+ 	for i, o := range b.hostConfigs {
+-		SSHKey, _ := findNameByID[db.AccessKey](o.SSHKeyID, b.keys)
++		SSHKey, err := findNameByID[db.AccessKey](o.SSHKeyID, b.keys)
++		if err != nil {
++			return nil, fmt.Errorf("host config %q (id %d) references ssh key id %d that is missing from the backup view", o.Name, o.ID, o.SSHKeyID)
++		}
+ 		hostConfigs[i] = BackupHostConfig{
+ 			HostConfig: o,
+ 			SSHKey:     SSHKey,
+@@ -401,13 +432,21 @@ func (b *BackupDB) format() (*BackupFormat, error) {
+ 	for i, o := range b.templates {
+ 		var View *string = nil
+ 		if o.ViewID != nil {
+-			View, _ = findNameByID[db.View](*o.ViewID, b.views)
++			name, err := findNameByID[db.View](*o.ViewID, b.views)
++			if err != nil {
++				return nil, fmt.Errorf("template %q (id %d) references view id %d that is missing from the backup view", o.Name, o.ID, *o.ViewID)
++			}
++			View = name
+ 		}
+ 		var vaults []BackupTemplateVault = nil
+ 		for _, vault := range o.Vaults {
+ 			var vaultKey *string = nil
+ 			if vault.VaultKeyID != nil {
+-				vaultKey, _ = findNameByID[db.AccessKey](*vault.VaultKeyID, b.keys)
++				name, err := findNameByID[db.AccessKey](*vault.VaultKeyID, b.keys)
++				if err != nil {
++					return nil, fmt.Errorf("template %q (id %d) vault id %d references key id %d that is missing from the backup view", o.Name, o.ID, vault.ID, *vault.VaultKeyID)
++				}
++				vaultKey = name
+ 			}
+ 			vaults = append(vaults, BackupTemplateVault{
+ 				TemplateVault: vault,
+@@ -417,20 +456,32 @@ func (b *BackupDB) format() (*BackupFormat, error) {
+ 		}
+ 		var Environments []string
+ 		for _, envID := range o.EnvironmentIDs {
+-			name, _ := findNameByID[db.Environment](envID, b.environments)
+-			if name != nil {
+-				Environments = append(Environments, *name)
++			name, err := findNameByID[db.Environment](envID, b.environments)
++			if err != nil {
++				return nil, fmt.Errorf("template %q (id %d) references variable group id %d that is missing from the backup view", o.Name, o.ID, envID)
+ 			}
++			Environments = append(Environments, *name)
+ 		}
+ 		var BuildTemplate *string = nil
+ 		if o.BuildTemplateID != nil {
+-			BuildTemplate, _ = findNameByID[db.Template](*o.BuildTemplateID, b.templates)
++			name, err := findNameByID[db.Template](*o.BuildTemplateID, b.templates)
++			if err != nil {
++				return nil, fmt.Errorf("template %q (id %d) references build template id %d that is missing from the backup view", o.Name, o.ID, *o.BuildTemplateID)
++			}
++			BuildTemplate = name
++		}
++		repositoryName, err := findNameByID[db.Repository](o.RepositoryID, b.repositories)
++		if err != nil {
++			return nil, fmt.Errorf("template %q (id %d) references repository id %d that is missing from the backup view", o.Name, o.ID, o.RepositoryID)
+ 		}
+-		Repository, _ := findNameByID[db.Repository](o.RepositoryID, b.repositories)
+ 
+ 		var Inventory *string = nil
+ 		if o.InventoryID != nil {
+-			Inventory, _ = findNameByID[db.Inventory](*o.InventoryID, b.inventories)
++			name, err := findNameByID[db.Inventory](*o.InventoryID, b.inventories)
++			if err != nil {
++				return nil, fmt.Errorf("template %q (id %d) references inventory id %d that is missing from the backup view", o.Name, o.ID, *o.InventoryID)
++			}
++			Inventory = name
+ 		}
+ 
+ 		if o.SurveyVarsJSON != nil {
+@@ -451,25 +502,26 @@ func (b *BackupDB) format() (*BackupFormat, error) {
+ 					IsGlobal:    false,
+ 					Permissions: r.Permissions,
+ 				})
+-			} else {
+-				// Try to find in Global
+-				name, err = findNameBySlug[db.Role](r.RoleSlug, b.globalRoles)
+-				if err != nil {
+-					continue
+-				}
++				continue
++			}
+ 
+-				roles = append(roles, BackupTemplateRole{
+-					Role:        *name,
+-					IsGlobal:    true,
+-					Permissions: r.Permissions,
+-				})
++			// Try to find in Global
++			name, err = findNameBySlug[db.Role](r.RoleSlug, b.globalRoles)
++			if err != nil {
++				return nil, fmt.Errorf("template %q (id %d) grants role %q that is missing from both project and global roles in the backup view", o.Name, o.ID, r.RoleSlug)
+ 			}
++
++			roles = append(roles, BackupTemplateRole{
++				Role:        *name,
++				IsGlobal:    true,
++				Permissions: r.Permissions,
++			})
+ 		}
+ 
+ 		templates[i] = BackupTemplate{
+ 			Template:      o,
+ 			View:          View,
+-			Repository:    *Repository,
++			Repository:    *repositoryName,
+ 			Inventory:     Inventory,
+ 			Environments:  Environments,
+ 			BuildTemplate: BuildTemplate,
+@@ -478,8 +530,8 @@ func (b *BackupDB) format() (*BackupFormat, error) {
+ 		}
+ 	}
+ 
+-	integrations := make([]BackupIntegration, len(b.integrations))
+-	for i, o := range b.integrations {
++	integrations := make([]BackupIntegration, 0, len(b.integrations))
++	for _, o := range b.integrations {
+ 
+ 		var aliases []string
+ 
+@@ -487,19 +539,21 @@ func (b *BackupDB) format() (*BackupFormat, error) {
+ 			aliases = append(aliases, a.Alias)
+ 		}
+ 
+-		tplName, _ := findNameByID[db.Template](o.TemplateID, b.templates)
+-
+-		if tplName == nil {
+-			continue
++		tplName, err := findNameByID[db.Template](o.TemplateID, b.templates)
++		if err != nil {
++			return nil, fmt.Errorf("integration %q (id %d) references template id %d that is missing from the backup view", o.Name, o.ID, o.TemplateID)
+ 		}
+ 
+ 		var keyName *string
+ 
+ 		if o.AuthSecretID != nil {
+-			keyName, _ = findNameByID[db.AccessKey](*o.AuthSecretID, b.keys)
++			keyName, err = findNameByID[db.AccessKey](*o.AuthSecretID, b.keys)
++			if err != nil {
++				return nil, fmt.Errorf("integration %q (id %d) references auth key id %d that is missing from the backup view", o.Name, o.ID, *o.AuthSecretID)
++			}
+ 		}
+ 
+-		integrations[i] = BackupIntegration{
++		bi := BackupIntegration{
+ 			Integration:   o,
+ 			Aliases:       aliases,
+ 			Matchers:      b.integrationMatchers[o.ID],
+@@ -509,8 +563,14 @@ func (b *BackupDB) format() (*BackupFormat, error) {
+ 		}
+ 
+ 		if o.TaskParams != nil && o.TaskParams.InventoryID != nil {
+-			integrations[i].TaskParams.InventoryName, _ = findNameByID[db.Inventory](*o.TaskParams.InventoryID, b.inventories)
++			invName, err := findNameByID[db.Inventory](*o.TaskParams.InventoryID, b.inventories)
++			if err != nil {
++				return nil, fmt.Errorf("integration %q (id %d) task parameters reference inventory id %d that is missing from the backup view", o.Name, o.ID, *o.TaskParams.InventoryID)
++			}
++			bi.TaskParams.InventoryName = invName
+ 		}
++
++		integrations = append(integrations, bi)
+ 	}
+ 
+ 	var integrationAliases []string
+@@ -534,10 +594,18 @@ func (b *BackupDB) format() (*BackupFormat, error) {
+ 				WorkflowNode: n,
+ 			}
+ 			if n.TemplateID != 0 {
+-				node.Template, _ = findNameByID[db.Template](n.TemplateID, b.templates)
++				tplName, err := findNameByID[db.Template](n.TemplateID, b.templates)
++				if err != nil {
++					return nil, fmt.Errorf("workflow %q (id %d) node %d references template id %d that is missing from the backup view", o.Name, o.ID, n.ID, n.TemplateID)
++				}
++				node.Template = tplName
+ 			}
+ 			if n.TaskParams != nil && n.TaskParams.InventoryID != nil {
+-				node.TaskParams.InventoryName, _ = findNameByID[db.Inventory](*n.TaskParams.InventoryID, b.inventories)
++				invName, err := findNameByID[db.Inventory](*n.TaskParams.InventoryID, b.inventories)
++				if err != nil {
++					return nil, fmt.Errorf("workflow %q (id %d) node %d task parameters reference inventory id %d that is missing from the backup view", o.Name, o.ID, n.ID, *n.TaskParams.InventoryID)
++				}
++				node.TaskParams.InventoryName = invName
+ 			}
+ 			nodes[j] = node
+ 		}
+@@ -568,11 +636,56 @@ func (b *BackupDB) format() (*BackupFormat, error) {
+ 	}, nil
+ }
+ 
++// backupLoadAttempts bounds how many times a failed export view is discarded
++// and reloaded. A retry is cheap: with a read snapshot the common cause is a
++// concurrent commit racing the snapshot start, which the next attempt cannot
++// see anymore.
++const backupLoadAttempts = 3
++
++// GetBackup builds one exportable project backup. All entities — the project
++// metadata, templates with their vaults and roles, repositories, host
++// configs, credentials, views, inventories, variable groups, schedules with
++// their task parameters, external secret stores, integrations with aliases
++// and matching rules, project roles and runners — are read from a single
++// read-only database snapshot, so the result always equals one committed
++// project state even while other members edit the project.
++//
++// If a consistent view cannot be taken, a read fails, or a required name
++// reference cannot be resolved inside the view, the attempt is discarded and a
++// fresh view is taken. Only a fully consistent backup is returned; the caller
++// therefore never writes a partial file or records a successful export.
+ func GetBackup(projectID int, store db.Store, workflowStore db.WorkflowManager) (*BackupFormat, error) {
++	var lastErr error
++
++	for range backupLoadAttempts {
++		backup, err := getBackupOnce(projectID, store, workflowStore)
++		if err == nil {
++			return backup, nil
++		}
++		lastErr = err
++	}
++
++	return nil, fmt.Errorf("could not obtain a consistent project backup after %d attempts: %w", backupLoadAttempts, lastErr)
++}
++
++func getBackupOnce(projectID int, store db.Store, workflowStore db.WorkflowManager) (*BackupFormat, error) {
+ 	backup := BackupDB{}
+-	if err := backup.load(projectID, store, workflowStore); err != nil {
+-		return nil, err
++
++	if snapshotStore, ok := store.(db.ReadSnapshotStore); ok {
++		if err := snapshotStore.WithReadSnapshot(func(view db.Store) error {
++			return backup.load(projectID, view, workflowStore)
++		}); err != nil {
++			return nil, err
++		}
++	} else {
++		if err := backup.load(projectID, store, workflowStore); err != nil {
++			return nil, err
++		}
+ 	}
++
++	// Resolving every name reference is done against the in-memory view just
++	// loaded; a failure means the view was not internally consistent and the
++	// caller discards it and retries.
+ 	return backup.format()
+ }
+ 
+diff --git a/services/project/backup_test.go b/services/project/backup_test.go
+index 7e9be8cf..ed9e7bd4 100644
+--- a/services/project/backup_test.go
++++ b/services/project/backup_test.go
+@@ -575,6 +575,105 @@ func TestRestore_RejectsInvalidHostConfig(t *testing.T) {
+ 	})
+ }
+ 
++// A backup view that stitched together different committed states (an old
++// parent with a deleted child, or a rebind landing half way through the reads)
++// must never be exported. format() resolves every foreign reference inside the
++// in-memory view by name and fails instead of silently dropping it; GetBackup
++// then discards the attempt.
++func TestBackupFormat_RejectsInconsistentView(t *testing.T) {
++	intPtr := func(v int) *int { return &v }
++
++	tests := []struct {
++		name       string
++		backup     BackupDB
++		errContain string
++	}{
++		{
++			name: "template references deleted repository",
++			backup: BackupDB{
++				templates: []db.Template{{ID: 1, Name: "T", RepositoryID: 99, Playbook: "x.yml"}},
++			},
++			errContain: "repository",
++		},
++		{
++			name: "schedule references deleted template",
++			backup: BackupDB{
++				schedules: []db.Schedule{{ID: 1, Name: "S", TemplateID: 99, CronFormat: "* * * * *"}},
++			},
++			errContain: "template",
++		},
++		{
++			name: "integration references deleted template",
++			backup: BackupDB{
++				integrationAliases:       map[int][]db.IntegrationAlias{},
++				integrationMatchers:      map[int][]db.IntegrationMatcher{},
++				integrationExtractValues: map[int][]db.IntegrationExtractValue{},
++				integrations:             []db.Integration{{ID: 1, Name: "I", TemplateID: 99}},
++			},
++			errContain: "template",
++		},
++		{
++			name: "template references deleted variable group",
++			backup: BackupDB{
++				repositories: []db.Repository{{ID: 1, Name: "R", SSHKeyID: 1}},
++				keys:         []db.AccessKey{{ID: 1, Name: "K", Type: db.AccessKeyNone}},
++				templates: []db.Template{{
++					ID: 1, Name: "T", RepositoryID: 1, Playbook: "x.yml",
++					EnvironmentIDs: []int{40},
++				}},
++			},
++			errContain: "variable group",
++		},
++		{
++			name: "template vault references deleted key",
++			backup: BackupDB{
++				repositories: []db.Repository{{ID: 1, Name: "R", SSHKeyID: 1}},
++				keys:         []db.AccessKey{{ID: 1, Name: "K", Type: db.AccessKeyNone}},
++				templates: []db.Template{{
++					ID: 1, Name: "T", RepositoryID: 1, Playbook: "x.yml",
++					Vaults: []db.TemplateVault{{ID: 1, Type: db.TemplateVaultPassword, VaultKeyID: intPtr(33)}},
++				}},
++			},
++			errContain: "vault",
++		},
++		{
++			name: "repository references deleted ssh key",
++			backup: BackupDB{
++				repositories: []db.Repository{{ID: 1, Name: "R", SSHKeyID: 50}},
++			},
++			errContain: "ssh key",
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			tt.backup.meta = db.Project{ID: 1, Name: "P"}
++			_, err := tt.backup.format()
++			require.Error(t, err)
++			assert.Contains(t, err.Error(), tt.errContain)
++		})
++	}
++}
++
++// A consistent view formats without error and every name it carries passes the
++// same preflight an imported backup goes through — a successful export file is
++// always restorable.
++func TestBackupFormat_ConsistentViewPassesPreflight(t *testing.T) {
++	b := BackupDB{
++		meta:         db.Project{ID: 1, Name: "P"},
++		keys:         []db.AccessKey{{ID: 1, Name: "K", Type: db.AccessKeyNone}},
++		repositories: []db.Repository{{ID: 1, Name: "R", SSHKeyID: 1}},
++		templates:    []db.Template{{ID: 1, Name: "T", RepositoryID: 1, Playbook: "x.yml"}},
++		schedules: []db.Schedule{{
++			ID: 1, Name: "S", TemplateID: 1, CronFormat: "0 0 * * *",
++		}},
++	}
++
++	formatted, err := b.format()
++	require.NoError(t, err)
++	require.NoError(t, formatted.Verify())
++}
++
+ // Old backups may carry bits the application never checks: restore keeps the roles and drops the bits.
+ func TestRestore_DropsUnknownPermissionBits(t *testing.T) {
+ 	util.Config = &util.ConfigType{TmpPath: "/tmp"}
