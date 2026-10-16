@@ -70,6 +70,15 @@ func DecideRunnerTaskAction(
 		return RunnerTaskFail, "runner restarted and lost the task"
 	}
 
+	// A runner with a pending cache cleanup is paused for new tasks. Jobs that
+	// were assigned but have not started yet are returned to the queue so a
+	// non-cleaning runner takes them over; already-running jobs stay on this
+	// runner (handled below by the liveness checks) and the cleanup waits for
+	// the last of them to finish.
+	if starting && runner.CacheCleanupActive() {
+		return RunnerTaskRequeue, "runner cache cleanup in progress"
+	}
+
 	// A webhook-driven runner may still be booting in response to the dispatch
 	// webhook; its heartbeat history (if any) predates this task, so staleness
 	// must not requeue a just-dispatched task. Once such a runner reports the

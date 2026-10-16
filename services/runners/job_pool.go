@@ -67,6 +67,11 @@ type JobPool struct {
 
 	processing int32
 
+	// cleanup is the state machine of the pending cache cleanup request (if
+	// any). While it is active the pool does not start any queued job and
+	// rejects NewJobs from poll responses.
+	cleanup cacheCleanup
+
 	// provider is the strategy that produces per-task Executors. Built once at
 	// startup from the runner's executor config. Nil when initialisation failed —
 	// dispatch refuses cleanly in that case instead of panicking on first task.
@@ -192,6 +197,25 @@ func (p *JobPool) enqueue(j *job) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.queue = append(p.queue, j)
+}
+
+// enqueueFront puts a job back at the head of the queue under the lock. Used
+// when a dequeued job cannot start yet (e.g. a cache cleanup is in progress)
+// so its FIFO position is not lost.
+func (p *JobPool) enqueueFront(j *job) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.queue = append([]*job{j}, p.queue...)
+}
+
+// clearQueue drops every queued job under the lock and returns how many were
+// dropped. Jobs already running are never touched.
+func (p *JobPool) clearQueue() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := len(p.queue)
+	p.queue = make([]*job, 0)
+	return n
 }
 
 // dequeue removes and returns the job at the front of the queue. The second
@@ -335,6 +359,16 @@ func (p *JobPool) Run() {
 				break
 			}
 
+			// A pending cache cleanup pauses this runner: already running jobs
+			// finish normally, but a queued job must not create repository or
+			// HOME directories that are about to be deleted. Keep it at the
+			// head of the queue until the cleanup is confirmed and the server
+			// resumes dispatching to this runner.
+			if p.cleanup.active() {
+				p.enqueueFront(t)
+				break
+			}
+
 			if t.status == task_logger.TaskFailStatus {
 				//delete failed TaskRunner from queue
 				log.WithFields(log.Fields{
@@ -449,6 +483,11 @@ func (p *JobPool) Run() {
 					fmt.Println("Runner connected")
 				}
 
+				// Advance a pending cache cleanup independently of job polls:
+				// wait for the last job, delete, retry on failure. The resulting
+				// state rides on the next progress PUT above.
+				p.cleanup.tick(p)
+
 				if util.Config.Runner.OneOff && ok && p.runningJobsCount() > 0 && !p.hasRunningJobs() {
 					os.Exit(0)
 				}
@@ -468,7 +507,8 @@ func (p *JobPool) sendProgress() (ok bool) {
 	url := util.Config.WebHost + "/api/internal/runners"
 
 	body := RunnerProgress{
-		Jobs: nil,
+		Jobs:         nil,
+		CacheCleanup: p.cleanup.progress(),
 	}
 
 	for id, j := range p.snapshotRunningJobs() {
@@ -849,27 +889,26 @@ func (p *JobPool) checkNewJobs() {
 	}
 
 	log.WithFields(log.Fields{
-		"context":      "checking_new_jobs",
-		"current_jobs": len(response.CurrentJobs),
-		"new_jobs":     len(response.NewJobs),
-		"clear_cache":  response.ClearCache,
-		"access_keys":  len(response.AccessKeys),
+		"context":       "checking_new_jobs",
+		"current_jobs":  len(response.CurrentJobs),
+		"new_jobs":      len(response.NewJobs),
+		"cache_cleanup": response.CacheCleanup != nil,
+		"access_keys":   len(response.AccessKeys),
 	}).Debug("Received runner state from the server")
 
-	if response.ClearCache {
-		if response.CacheCleanProjectID == nil {
-			if err2 := util.Config.ClearTmpDir(); err2 != nil {
-				log.WithError(err2).WithFields(log.Fields{
-					"context": "checking_new_jobs",
-				}).Error("failed to clear tmp directory")
-			}
-		} else {
-			if err2 := util.Config.ClearProjectTmpDir(*response.CacheCleanProjectID); err2 != nil {
-				log.WithError(err2).WithFields(log.Fields{
-					"context":    "checking_new_jobs",
-					"project_id": *response.CacheCleanProjectID,
-				}).Error("failed to clear project tmp directory")
-			}
+	// Arm/disarm the confirmable cleanup request. While it is pending the
+	// runner must not start jobs that were accepted before the request (they
+	// have not touched the cache yet and the server requeues them for other
+	// runners), and it must not accept any NewJobs delivered in this poll.
+	p.cleanup.handleDirective(response.CacheCleanup)
+
+	if response.CacheCleanup != nil {
+		if dropped := p.clearQueue(); dropped > 0 {
+			log.WithFields(log.Fields{
+				"context":         "checking_new_jobs",
+				"dropped_jobs":    dropped,
+				"cleanup_request": response.CacheCleanup.RequestID,
+			}).Info("Discarding queued jobs while cache cleanup is pending; the server will reassign them")
 		}
 	}
 
@@ -930,6 +969,22 @@ func (p *JobPool) checkNewJobs() {
 		if p.queueLen() > 0 || p.runningJobsCount() > 0 {
 			return
 		}
+	}
+
+	// A runner with a pending cache cleanup is paused. The server is expected
+	// not to send NewJobs in this state, but the check is enforced here as
+	// well so no job can ever be accepted against a pending directive (races
+	// with the request being created between dispatch selection and response
+	// assembly, mixed versions, duplicated in-flight polls).
+	if response.CacheCleanup != nil {
+		if len(response.NewJobs) > 0 {
+			log.WithFields(log.Fields{
+				"context":         "checking_new_jobs",
+				"new_jobs":        len(response.NewJobs),
+				"cleanup_request": response.CacheCleanup.RequestID,
+			}).Debug("Refusing new jobs while a cache cleanup request is pending")
+		}
+		return
 	}
 
 	for _, newJob := range response.NewJobs {

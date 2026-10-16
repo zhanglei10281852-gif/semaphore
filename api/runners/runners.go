@@ -87,8 +87,6 @@ func (c *RunnerController) GetRunner(w http.ResponseWriter, r *http.Request) {
 		"runner_id": runner.ID,
 	})
 
-	clearCache := false
-
 	// The runner reports its process start time on every poll. It changes on
 	// every restart and is persisted next to "touched", so the task reconciler
 	// can detect runners that restarted and lost their in-memory job pool.
@@ -115,17 +113,27 @@ func (c *RunnerController) GetRunner(w http.ResponseWriter, r *http.Request) {
 		runnerLog.Debug("Runner became online")
 	}
 
-	if runner.CleaningRequested != nil && (runner.Touched == nil || runner.CleaningRequested.After(*runner.Touched)) {
-		clearCache = true
-	}
-
 	data := runners.RunnerState{
 		AccessKeys: make(map[int]db.AccessKey),
-		ClearCache: clearCache,
 	}
 
-	if clearCache {
-		data.CacheCleanProjectID = runner.ProjectID
+	// While a cleanup request is pending, the runner is paused: the poll
+	// carries the directive (with the request ID the runner must confirm)
+	// but no new jobs. Jobs already assigned keep syncing their state and
+	// finish normally; not-yet-started tasks are returned to the queue by the
+	// reconciler so other runners can take them over.
+	cleanupActive := runner.CacheCleanupActive()
+
+	if cleanupActive && runner.CleaningRequestID != nil {
+		directive := &runners.CacheCleanupDirective{
+			RequestID: *runner.CleaningRequestID,
+			Scope:     runners.CacheCleanupScope(runner.CacheCleanupScope()),
+		}
+		if runner.ProjectID != nil {
+			projectID := *runner.ProjectID
+			directive.ProjectID = &projectID
+		}
+		data.CacheCleanup = directive
 	}
 
 	runningTasks := c.taskPool.GetRunningTasks()
@@ -135,7 +143,7 @@ func (c *RunnerController) GetRunner(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		if tsk.Task.Status == task_logger.TaskWaitingStatus || tsk.Task.Status == task_logger.TaskStartingStatus {
+		if (tsk.Task.Status == task_logger.TaskWaitingStatus || tsk.Task.Status == task_logger.TaskStartingStatus) && !cleanupActive {
 
 			c.prepareRemoteJob(tsk, &runner, &data)
 
@@ -368,11 +376,6 @@ func (c *RunnerController) UpdateRunner(w http.ResponseWriter, r *http.Request) 
 
 	taskPool := c.taskPool
 
-	if body.Jobs == nil {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
 	var response runners.RunnerProgressResponse
 	logRecordCount := 0
 
@@ -498,7 +501,90 @@ func (c *RunnerController) UpdateRunner(w http.ResponseWriter, r *http.Request) 
 		}).Debug("Runner task update processed")
 	}
 
+	c.handleCacheCleanupReport(r, runner, body.CacheCleanup)
+
+	// Old runners (and the new runner with no running jobs) send an empty Jobs
+	// list; keep the empty 204 reply for them. A cache cleanup confirmation on
+	// such a report was still applied above.
+	if len(body.Jobs) == 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	helpers.WriteJSON(w, http.StatusOK, response)
+}
+
+// handleCacheCleanupReport advances a pending runner cache cleanup request
+// based on the runner's report. The store applies the state only when the
+// request ID matches the one currently stored on the runner, so a late
+// confirmation of an older (superseded) request never finishes the newer one.
+// A successful "done" report is accepted exactly once and is the only event
+// that audits the cleanup as completed: the request-time event records the
+// intent, this one records the actual deletion. Cleanup failures leave the
+// request active (the runner retries), so they are logged but not audited as
+// completion.
+func (c *RunnerController) handleCacheCleanupReport(r *http.Request, runner db.Runner, report *runners.CacheCleanupProgress) {
+	if report == nil {
+		return
+	}
+
+	if !report.Status.Valid() {
+		log.WithFields(log.Fields{
+			"context":         "runner",
+			"runner_id":       runner.ID,
+			"cleanup_request": report.RequestID,
+			"reported_status": string(report.Status),
+		}).Warn("Ignoring runner cache cleanup report with invalid status")
+		return
+	}
+
+	store := helpers.Store(r)
+
+	applied, err := store.ReportRunnerCacheCleanup(runner, report.RequestID, report.Status, report.Error)
+	if err != nil {
+		log.WithError(err).WithFields(log.Fields{
+			"context":         "runner",
+			"runner_id":       runner.ID,
+			"cleanup_request": report.RequestID,
+			"reported_status": string(report.Status),
+		}).Error("failed to persist runner cache cleanup report")
+		return
+	}
+
+	if !applied {
+		log.WithFields(log.Fields{
+			"context":         "runner",
+			"runner_id":       runner.ID,
+			"cleanup_request": report.RequestID,
+			"reported_status": string(report.Status),
+		}).Debug("Ignoring stale runner cache cleanup report: request ID does not match the current request")
+		return
+	}
+
+	switch report.Status {
+	case db.RunnerCacheCleanupDone:
+		projectID := 0
+		if runner.ProjectID != nil {
+			projectID = *runner.ProjectID
+		}
+		helpers.Audit(r).Record(r.Context(), audit.Event{
+			Kind:      audit.RunnerCacheClear,
+			Outcome:   audit.OutcomeSuccess,
+			Target:    audit.ResourceTarget(audit.TargetRunner, runner.ID, runner.Name),
+			ProjectID: projectID,
+			Metadata: audit.RunnerCacheClearMetadata{
+				RequestID: report.RequestID,
+				Scope:     runner.CacheCleanupScope(),
+				Phase:     "completed",
+			},
+		})
+	case db.RunnerCacheCleanupFailed:
+		log.WithFields(log.Fields{
+			"context":         "runner",
+			"runner_id":       runner.ID,
+			"cleanup_request": report.RequestID,
+		}).Warn("Runner cache cleanup attempt failed; the runner keeps the request pending and retries: " + report.Error)
+	}
 }
 
 func RegisterRunner(w http.ResponseWriter, r *http.Request) {

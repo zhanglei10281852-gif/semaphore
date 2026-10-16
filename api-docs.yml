@@ -1314,6 +1314,29 @@ definitions:
       cleaning_requested:
         type: string
         format: date-time
+        description: Time the latest cache cleanup request was created.
+        x-nullable: true
+      cleaning_request_id:
+        type: string
+        description: ID of the latest cache cleanup request; the runner must echo it on its completion report.
+        x-nullable: true
+      cleaning_status:
+        type: string
+        description: >
+          State of the latest cache cleanup request: waiting (paused, draining
+          assigned jobs), cleaning (deleting directories), failed (last attempt
+          failed, the runner retries automatically) or done (completed). Null
+          when no cleanup was ever requested.
+        enum: [waiting, cleaning, failed, done]
+        x-nullable: true
+      cleaning_error:
+        type: string
+        description: Error message of the last failed cleanup attempt.
+        x-nullable: true
+      cleaning_updated_at:
+        type: string
+        format: date-time
+        description: Time of the last cleanup state change (completion time when status is done).
         x-nullable: true
       registered:
         type: boolean
@@ -1363,6 +1386,21 @@ definitions:
     properties:
       active:
         type: boolean
+
+  RunnerCacheCleanup:
+    type: object
+    properties:
+      request_id:
+        type: string
+        description: Unique ID of the created cleanup request.
+      status:
+        type: string
+        enum: [waiting, cleaning, failed, done]
+        description: Initial state of the request (waiting).
+      scope:
+        type: string
+        enum: [all, project]
+        description: Directories the runner deletes: the whole cache for global runners, only the owning project directory for project runners.
 
   RunnerRegistrationToken:
     type: object
@@ -4002,10 +4040,20 @@ paths:
     delete:
       tags:
         - runner
-      summary: Clear project runner cache
+      summary: Request project runner cache cleanup
+      description: >
+        Opens a confirmable cache cleanup request scoped to the runner's
+        project. The runner pauses new task dispatch, lets assigned jobs
+        finish, deletes the project cache directory and confirms completion.
+        The request stays pending until that confirmation; progress is
+        visible through the runner's cleaning_status field.
       responses:
-        204:
-          description: Runner cache cleared
+        202:
+          description: Cleanup request accepted
+          schema:
+            $ref: "#/definitions/RunnerCacheCleanup"
+        404:
+          description: Runner not found
 
   # global runners (admin)
   /runners:
@@ -4128,7 +4176,17 @@ paths:
     delete:
       tags:
         - runner
-      summary: Clear global runner cache
+      summary: Request global runner cache cleanup
+      description: >
+        Opens a confirmable cache cleanup request with full-cache scope. The
+        runner pauses new task dispatch, lets assigned jobs finish, deletes
+        the whole cache directory and confirms completion. The request stays
+        pending until that confirmation; progress is visible through the
+        runner's cleaning_status field.
       responses:
-        204:
-          description: Runner cache cleared
+        202:
+          description: Cleanup request accepted
+          schema:
+            $ref: "#/definitions/RunnerCacheCleanup"
+        404:
+          description: Runner not found

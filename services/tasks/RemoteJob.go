@@ -109,11 +109,12 @@ func shuffleRunners(rs []db.Runner) []db.Runner {
 	return shuffled
 }
 
-// selectRunner returns the first runner that is online (see db.Runner.IsOnline)
-// and has free capacity, or nil when there is none. Offline runners are
-// excluded outright — dispatching to a silent runner is exactly how tasks used
-// to hang forever; a task with no online runner stays queued instead and is
-// retried by the pool.
+// selectRunner returns the first runner that is online (see db.Runner.IsOnline),
+// is not paused for a pending cache cleanup and has free capacity, or nil when
+// there is none. Offline and cleaning runners are excluded outright —
+// dispatching to a silent runner is exactly how tasks used to hang forever; a
+// task with no available runner stays queued instead and is retried by the
+// pool, which also lets a non-cleaning runner take it over.
 func selectRunner(
 	runners []db.Runner,
 	now time.Time,
@@ -123,6 +124,9 @@ func selectRunner(
 	for i := range runners {
 		r := &runners[i]
 		if !r.IsOnline(now, offlineTimeout) {
+			continue
+		}
+		if r.CacheCleanupActive() {
 			continue
 		}
 		if r.HasFreeCapacity(busyTasks(r.ID)) {
@@ -150,6 +154,8 @@ func runnerExclusionReason(
 		return "tag_mismatch"
 	case !r.IsOnline(now, offlineTimeout):
 		return "offline"
+	case r.CacheCleanupActive():
+		return "cache_cleanup"
 	case !r.HasFreeCapacity(runningTasks):
 		return "at_capacity"
 	default:

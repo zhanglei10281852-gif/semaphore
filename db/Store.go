@@ -530,7 +530,18 @@ type RunnerManager interface {
 	// registration token hash and its expiry.
 	ResetRunnerRegistration(runnerID int, registrationTokenHash string, expiresAt time.Time) error
 	TouchRunner(runner Runner) (err error)
-	ClearRunnerCache(runner Runner) (err error)
+	// RequestRunnerCacheCleanup opens a new confirmable cache cleanup request
+	// for the runner, superseding any previous one. The runner row moves to
+	// RunnerCacheCleanupWaiting and the generated request ID is returned; the
+	// runner must echo it on its completion report.
+	RequestRunnerCacheCleanup(runner Runner) (requestID string, err error)
+	// ReportRunnerCacheCleanup applies a runner-reported cleanup state, but
+	// only when requestID matches the request currently stored on the row:
+	// a late confirmation of an older request is ignored. Applied is false
+	// when no row matched (unknown/stale request) and true when the state was
+	// persisted (including idempotent re-reports of the same state). A
+	// "done" report is accepted exactly once per request.
+	ReportRunnerCacheCleanup(runner Runner, requestID string, status RunnerCacheCleanupStatus, failureReason string) (applied bool, err error)
 	GetRunnerTags(projectID int) ([]RunnerTag, error)
 	GetGlobalRunnerTags() ([]RunnerTag, error)
 	GetRunnerCount() (int, error)

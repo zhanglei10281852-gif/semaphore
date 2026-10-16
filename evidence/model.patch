@@ -1,0 +1,1407 @@
+diff --git a/api-docs.yml b/api-docs.yml
+index 87a59bd8..3c267480 100644
+--- a/api-docs.yml
++++ b/api-docs.yml
+@@ -1314,6 +1314,29 @@ definitions:
+       cleaning_requested:
+         type: string
+         format: date-time
++        description: Time the latest cache cleanup request was created.
++        x-nullable: true
++      cleaning_request_id:
++        type: string
++        description: ID of the latest cache cleanup request; the runner must echo it on its completion report.
++        x-nullable: true
++      cleaning_status:
++        type: string
++        description: >
++          State of the latest cache cleanup request: waiting (paused, draining
++          assigned jobs), cleaning (deleting directories), failed (last attempt
++          failed, the runner retries automatically) or done (completed). Null
++          when no cleanup was ever requested.
++        enum: [waiting, cleaning, failed, done]
++        x-nullable: true
++      cleaning_error:
++        type: string
++        description: Error message of the last failed cleanup attempt.
++        x-nullable: true
++      cleaning_updated_at:
++        type: string
++        format: date-time
++        description: Time of the last cleanup state change (completion time when status is done).
+         x-nullable: true
+       registered:
+         type: boolean
+@@ -1364,6 +1387,21 @@ definitions:
+       active:
+         type: boolean
+ 
++  RunnerCacheCleanup:
++    type: object
++    properties:
++      request_id:
++        type: string
++        description: Unique ID of the created cleanup request.
++      status:
++        type: string
++        enum: [waiting, cleaning, failed, done]
++        description: Initial state of the request (waiting).
++      scope:
++        type: string
++        enum: [all, project]
++        description: Directories the runner deletes: the whole cache for global runners, only the owning project directory for project runners.
++
+   RunnerRegistrationToken:
+     type: object
+     properties:
+@@ -4002,10 +4040,20 @@ paths:
+     delete:
+       tags:
+         - runner
+-      summary: Clear project runner cache
+-      responses:
+-        204:
+-          description: Runner cache cleared
++      summary: Request project runner cache cleanup
++      description: >
++        Opens a confirmable cache cleanup request scoped to the runner's
++        project. The runner pauses new task dispatch, lets assigned jobs
++        finish, deletes the project cache directory and confirms completion.
++        The request stays pending until that confirmation; progress is
++        visible through the runner's cleaning_status field.
++      responses:
++        202:
++          description: Cleanup request accepted
++          schema:
++            $ref: "#/definitions/RunnerCacheCleanup"
++        404:
++          description: Runner not found
+ 
+   # global runners (admin)
+   /runners:
+@@ -4128,7 +4176,17 @@ paths:
+     delete:
+       tags:
+         - runner
+-      summary: Clear global runner cache
+-      responses:
+-        204:
+-          description: Runner cache cleared
++      summary: Request global runner cache cleanup
++      description: >
++        Opens a confirmable cache cleanup request with full-cache scope. The
++        runner pauses new task dispatch, lets assigned jobs finish, deletes
++        the whole cache directory and confirms completion. The request stays
++        pending until that confirmation; progress is visible through the
++        runner's cleaning_status field.
++      responses:
++        202:
++          description: Cleanup request accepted
++          schema:
++            $ref: "#/definitions/RunnerCacheCleanup"
++        404:
++          description: Runner not found
+diff --git a/api/runners.go b/api/runners.go
+index 184b0680..c9066f05 100644
+--- a/api/runners.go
++++ b/api/runners.go
+@@ -138,24 +138,53 @@ func (c *GlobalRunnerController) UpdateRunner(w http.ResponseWriter, r *http.Req
+ 	w.WriteHeader(http.StatusNoContent)
+ }
+ 
++// ClearRunnerCache opens a confirmable cache cleanup request for the runner.
++// It does not delete anything itself: the runner pauses task dispatch, lets
++// its in-scope jobs finish, deletes the directories and reports completion.
++// The request stays pending on the runner row until that confirmation, so the
++// response carries the request ID and the current state for the UI/API.
+ func (c *GlobalRunnerController) ClearRunnerCache(w http.ResponseWriter, r *http.Request) {
+ 	runner := helpers.GetFromContext(r, "runner").(*db.Runner)
+ 
+ 	store := helpers.Store(r)
+ 
+-	err := store.ClearRunnerCache(*runner)
++	requestID, err := store.RequestRunnerCacheCleanup(*runner)
+ 
+ 	if err != nil {
+ 		helpers.WriteError(w, err)
+ 		return
+ 	}
+ 
++	projectID := 0
++	if runner.ProjectID != nil {
++		projectID = *runner.ProjectID
++	}
++
+ 	helpers.Audit(r).Record(r.Context(), audit.Event{
+-		Kind:   audit.RunnerCacheClear,
+-		Target: audit.ResourceTarget(audit.TargetRunner, runner.ID, runner.Name),
++		Kind:      audit.RunnerCacheClear,
++		Target:    audit.ResourceTarget(audit.TargetRunner, runner.ID, runner.Name),
++		ProjectID: projectID,
++		Metadata: audit.RunnerCacheClearMetadata{
++			RequestID: requestID,
++			Scope:     runner.CacheCleanupScope(),
++			Phase:     "requested",
++		},
+ 	})
+ 
+-	w.WriteHeader(http.StatusNoContent)
++	helpers.WriteJSON(w, http.StatusAccepted, runnerCacheCleanupResponse{
++		RequestID: requestID,
++		Status:    string(db.RunnerCacheCleanupWaiting),
++		Scope:     runner.CacheCleanupScope(),
++	})
++}
++
++// runnerCacheCleanupResponse describes the cleanup request created by a DELETE
++// .../cache call. The request remains queryable through the runner object's
++// cleaning_* fields until the runner confirms completion.
++type runnerCacheCleanupResponse struct {
++	RequestID string `json:"request_id"`
++	Status    string `json:"status"`
++	Scope     string `json:"scope"`
+ }
+ 
+ func (c *GlobalRunnerController) DeleteRunner(w http.ResponseWriter, r *http.Request) {
+diff --git a/api/runners/runners.go b/api/runners/runners.go
+index 07c9a271..df8843c9 100644
+--- a/api/runners/runners.go
++++ b/api/runners/runners.go
+@@ -87,8 +87,6 @@ func (c *RunnerController) GetRunner(w http.ResponseWriter, r *http.Request) {
+ 		"runner_id": runner.ID,
+ 	})
+ 
+-	clearCache := false
+-
+ 	// The runner reports its process start time on every poll. It changes on
+ 	// every restart and is persisted next to "touched", so the task reconciler
+ 	// can detect runners that restarted and lost their in-memory job pool.
+@@ -115,17 +113,27 @@ func (c *RunnerController) GetRunner(w http.ResponseWriter, r *http.Request) {
+ 		runnerLog.Debug("Runner became online")
+ 	}
+ 
+-	if runner.CleaningRequested != nil && (runner.Touched == nil || runner.CleaningRequested.After(*runner.Touched)) {
+-		clearCache = true
+-	}
+-
+ 	data := runners.RunnerState{
+ 		AccessKeys: make(map[int]db.AccessKey),
+-		ClearCache: clearCache,
+ 	}
+ 
+-	if clearCache {
+-		data.CacheCleanProjectID = runner.ProjectID
++	// While a cleanup request is pending, the runner is paused: the poll
++	// carries the directive (with the request ID the runner must confirm)
++	// but no new jobs. Jobs already assigned keep syncing their state and
++	// finish normally; not-yet-started tasks are returned to the queue by the
++	// reconciler so other runners can take them over.
++	cleanupActive := runner.CacheCleanupActive()
++
++	if cleanupActive && runner.CleaningRequestID != nil {
++		directive := &runners.CacheCleanupDirective{
++			RequestID: *runner.CleaningRequestID,
++			Scope:     runners.CacheCleanupScope(runner.CacheCleanupScope()),
++		}
++		if runner.ProjectID != nil {
++			projectID := *runner.ProjectID
++			directive.ProjectID = &projectID
++		}
++		data.CacheCleanup = directive
+ 	}
+ 
+ 	runningTasks := c.taskPool.GetRunningTasks()
+@@ -135,7 +143,7 @@ func (c *RunnerController) GetRunner(w http.ResponseWriter, r *http.Request) {
+ 			continue
+ 		}
+ 
+-		if tsk.Task.Status == task_logger.TaskWaitingStatus || tsk.Task.Status == task_logger.TaskStartingStatus {
++		if (tsk.Task.Status == task_logger.TaskWaitingStatus || tsk.Task.Status == task_logger.TaskStartingStatus) && !cleanupActive {
+ 
+ 			c.prepareRemoteJob(tsk, &runner, &data)
+ 
+@@ -368,11 +376,6 @@ func (c *RunnerController) UpdateRunner(w http.ResponseWriter, r *http.Request)
+ 
+ 	taskPool := c.taskPool
+ 
+-	if body.Jobs == nil {
+-		w.WriteHeader(http.StatusNoContent)
+-		return
+-	}
+-
+ 	var response runners.RunnerProgressResponse
+ 	logRecordCount := 0
+ 
+@@ -498,9 +501,92 @@ func (c *RunnerController) UpdateRunner(w http.ResponseWriter, r *http.Request)
+ 		}).Debug("Runner task update processed")
+ 	}
+ 
++	c.handleCacheCleanupReport(r, runner, body.CacheCleanup)
++
++	// Old runners (and the new runner with no running jobs) send an empty Jobs
++	// list; keep the empty 204 reply for them. A cache cleanup confirmation on
++	// such a report was still applied above.
++	if len(body.Jobs) == 0 {
++		w.WriteHeader(http.StatusNoContent)
++		return
++	}
++
+ 	helpers.WriteJSON(w, http.StatusOK, response)
+ }
+ 
++// handleCacheCleanupReport advances a pending runner cache cleanup request
++// based on the runner's report. The store applies the state only when the
++// request ID matches the one currently stored on the runner, so a late
++// confirmation of an older (superseded) request never finishes the newer one.
++// A successful "done" report is accepted exactly once and is the only event
++// that audits the cleanup as completed: the request-time event records the
++// intent, this one records the actual deletion. Cleanup failures leave the
++// request active (the runner retries), so they are logged but not audited as
++// completion.
++func (c *RunnerController) handleCacheCleanupReport(r *http.Request, runner db.Runner, report *runners.CacheCleanupProgress) {
++	if report == nil {
++		return
++	}
++
++	if !report.Status.Valid() {
++		log.WithFields(log.Fields{
++			"context":         "runner",
++			"runner_id":       runner.ID,
++			"cleanup_request": report.RequestID,
++			"reported_status": string(report.Status),
++		}).Warn("Ignoring runner cache cleanup report with invalid status")
++		return
++	}
++
++	store := helpers.Store(r)
++
++	applied, err := store.ReportRunnerCacheCleanup(runner, report.RequestID, report.Status, report.Error)
++	if err != nil {
++		log.WithError(err).WithFields(log.Fields{
++			"context":         "runner",
++			"runner_id":       runner.ID,
++			"cleanup_request": report.RequestID,
++			"reported_status": string(report.Status),
++		}).Error("failed to persist runner cache cleanup report")
++		return
++	}
++
++	if !applied {
++		log.WithFields(log.Fields{
++			"context":         "runner",
++			"runner_id":       runner.ID,
++			"cleanup_request": report.RequestID,
++			"reported_status": string(report.Status),
++		}).Debug("Ignoring stale runner cache cleanup report: request ID does not match the current request")
++		return
++	}
++
++	switch report.Status {
++	case db.RunnerCacheCleanupDone:
++		projectID := 0
++		if runner.ProjectID != nil {
++			projectID = *runner.ProjectID
++		}
++		helpers.Audit(r).Record(r.Context(), audit.Event{
++			Kind:      audit.RunnerCacheClear,
++			Outcome:   audit.OutcomeSuccess,
++			Target:    audit.ResourceTarget(audit.TargetRunner, runner.ID, runner.Name),
++			ProjectID: projectID,
++			Metadata: audit.RunnerCacheClearMetadata{
++				RequestID: report.RequestID,
++				Scope:     runner.CacheCleanupScope(),
++				Phase:     "completed",
++			},
++		})
++	case db.RunnerCacheCleanupFailed:
++		log.WithFields(log.Fields{
++			"context":         "runner",
++			"runner_id":       runner.ID,
++			"cleanup_request": report.RequestID,
++		}).Warn("Runner cache cleanup attempt failed; the runner keeps the request pending and retries: " + report.Error)
++	}
++}
++
+ func RegisterRunner(w http.ResponseWriter, r *http.Request) {
+ 	var register runners.RunnerRegistration
+ 
+diff --git a/api/runners/runners_test.go b/api/runners/runners_test.go
+index 7b270bee..521ed354 100644
+--- a/api/runners/runners_test.go
++++ b/api/runners/runners_test.go
+@@ -2,10 +2,12 @@ package runners
+ 
+ import (
+ 	"bytes"
++	"context"
+ 	"encoding/json"
+ 	"errors"
+ 	"net/http"
+ 	"net/http/httptest"
++	"sync"
+ 	"testing"
+ 
+ 	"github.com/semaphoreui/semaphore/api/helpers"
+@@ -14,6 +16,7 @@ import (
+ 	"github.com/semaphoreui/semaphore/pkg/task_logger"
+ 	"github.com/semaphoreui/semaphore/pkg/tz"
+ 	"github.com/semaphoreui/semaphore/pro_interfaces"
++	"github.com/semaphoreui/semaphore/services/audit"
+ 	"github.com/semaphoreui/semaphore/services/runners"
+ 	"github.com/semaphoreui/semaphore/services/tasks"
+ 	"github.com/semaphoreui/semaphore/util"
+@@ -21,6 +24,36 @@ import (
+ 	"github.com/stretchr/testify/require"
+ )
+ 
++// capturingRecorder stores audited events in memory.
++type capturingRecorder struct {
++	mu     sync.Mutex
++	events []audit.Event
++}
++
++func (c *capturingRecorder) Record(_ context.Context, event audit.Event) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.events = append(c.events, event)
++}
++
++func (c *capturingRecorder) snapshot() []audit.Event {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	out := make([]audit.Event, len(c.events))
++	copy(out, c.events)
++	return out
++}
++
++func (c *capturingRecorder) completionCount() int {
++	count := 0
++	for _, e := range c.snapshot() {
++		if e.Kind == audit.RunnerCacheClear && e.Outcome == audit.OutcomeSuccess {
++			count++
++		}
++	}
++	return count
++}
++
+ func TestRegisterRunner_InvalidTokenReturnsBadRequest(t *testing.T) {
+ 	store := sql.InitConfigCreateTestStore()
+ 
+@@ -495,3 +528,177 @@ func TestUpdateRunner_SuccessWithoutOutputs(t *testing.T) {
+ 	assert.Equal(t, task_logger.TaskSuccessStatus, fixture.task.Task.Status)
+ 	assert.Nil(t, fixture.task.Task.Artifacts)
+ }
++
++func newCleanupControllerFixture(t *testing.T) (db.Store, *tasks.TaskPool, *RunnerController) {
++	t.Helper()
++	prevCfg := util.Config
++	t.Cleanup(func() { util.Config = prevCfg })
++
++	store := sql.InitConfigCreateTestStore()
++	pool := tasks.CreateTaskPool(
++		store,
++		tasks.NewMemoryTaskStateStore(),
++		nil, nil, nil, nil, nil, nil, nil,
++	)
++	return store, &pool, NewRunnerController(store, &pool, nil, nil)
++}
++
++func TestGetRunner_CacheCleanupDirectivePausesNewJobs(t *testing.T) {
++	store, pool, ctrl := newCleanupControllerFixture(t)
++
++	runner, err := store.CreateRunner(db.Runner{Name: "cleaning", Token: "token", Active: true})
++	require.NoError(t, err)
++
++	// A waiting task already assigned to the runner must be reported as a
++	// current job (not dispatched again) while the cleanup is pending.
++	runnerID := runner.ID
++	tr := tasks.NewTaskRunner(db.Task{
++		ID:        70,
++		ProjectID: 1,
++		RunnerID:  &runnerID,
++		Status:    task_logger.TaskWaitingStatus,
++	}, pool, "", nil)
++	pool.StateStore().SetRunning(tr)
++
++	requestID, err := store.RequestRunnerCacheCleanup(runner)
++	require.NoError(t, err)
++
++	doPoll := func() runners.RunnerState {
++		fresh, err := store.GetGlobalRunner(runner.ID)
++		require.NoError(t, err)
++		req := httptest.NewRequest(http.MethodGet, "/api/internal/runners", nil)
++		req = helpers.SetContextValue(req, "store", store)
++		req = helpers.SetContextValue(req, "runner", fresh)
++		w := httptest.NewRecorder()
++		ctrl.GetRunner(w, req)
++		require.Equal(t, http.StatusOK, w.Code)
++		var state runners.RunnerState
++		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &state))
++		return state
++	}
++
++	state := doPoll()
++	require.NotNil(t, state.CacheCleanup)
++	assert.Equal(t, requestID, state.CacheCleanup.RequestID)
++	assert.Equal(t, runners.CacheCleanupAll, state.CacheCleanup.Scope)
++	assert.Empty(t, state.NewJobs, "paused runner must not receive new jobs")
++	require.Len(t, state.CurrentJobs, 1)
++	assert.Equal(t, 70, state.CurrentJobs[0].ID)
++
++	// Once the request is completed, no directive is sent anymore.
++	applied, err := store.ReportRunnerCacheCleanup(runner, requestID, db.RunnerCacheCleanupDone, "")
++	require.NoError(t, err)
++	require.True(t, applied)
++	pool.StateStore().DeleteRunning(tr.Task.ID)
++
++	state = doPoll()
++	assert.Nil(t, state.CacheCleanup)
++}
++
++func TestUpdateRunner_CacheCleanupConfirmations(t *testing.T) {
++	store, _, ctrl := newCleanupControllerFixture(t)
++
++	runner, err := store.CreateRunner(db.Runner{Name: "cleaning-confirm", Token: "token", Active: true})
++	require.NoError(t, err)
++
++	requestID, err := store.RequestRunnerCacheCleanup(runner)
++	require.NoError(t, err)
++
++	recorder := &capturingRecorder{}
++
++	report := func(progress *runners.CacheCleanupProgress) int {
++		req := newProgressRequest(t, store, runner, runners.RunnerProgress{CacheCleanup: progress})
++		req = helpers.SetContextValue(req, "audit", audit.Recorder(recorder))
++		w := httptest.NewRecorder()
++		ctrl.UpdateRunner(w, req)
++		return w.Code
++	}
++
++	getStatus := func() string {
++		row, err := store.GetGlobalRunner(runner.ID)
++		require.NoError(t, err)
++		if row.CleaningStatus == nil {
++			return ""
++		}
++		return *row.CleaningStatus
++	}
++
++	// waiting -> cleaning, no completion audit yet.
++	assert.Equal(t, http.StatusNoContent, report(&runners.CacheCleanupProgress{
++		RequestID: requestID,
++		Status:    db.RunnerCacheCleanupCleaning,
++	}))
++	assert.Equal(t, string(db.RunnerCacheCleanupCleaning), getStatus())
++	assert.Zero(t, recorder.completionCount())
++
++	// A failure report keeps the request active and records no completion.
++	assert.Equal(t, http.StatusNoContent, report(&runners.CacheCleanupProgress{
++		RequestID: requestID,
++		Status:    db.RunnerCacheCleanupFailed,
++		Error:     "device busy",
++	}))
++	assert.Equal(t, string(db.RunnerCacheCleanupFailed), getStatus())
++	row, err := store.GetGlobalRunner(runner.ID)
++	require.NoError(t, err)
++	require.NotNil(t, row.CleaningError)
++	assert.Equal(t, "device busy", *row.CleaningError)
++	assert.Zero(t, recorder.completionCount())
++
++	// Retry succeeds: the request completes and exactly one success audit is
++	// recorded, carrying the matching request ID.
++	assert.Equal(t, http.StatusNoContent, report(&runners.CacheCleanupProgress{
++		RequestID: requestID,
++		Status:    db.RunnerCacheCleanupCleaning,
++	}))
++	assert.Equal(t, http.StatusNoContent, report(&runners.CacheCleanupProgress{
++		RequestID: requestID,
++		Status:    db.RunnerCacheCleanupDone,
++	}))
++	assert.Equal(t, string(db.RunnerCacheCleanupDone), getStatus())
++	assert.Equal(t, 1, recorder.completionCount())
++
++	events := recorder.snapshot()
++	require.NotEmpty(t, events)
++	last := events[len(events)-1]
++	assert.Equal(t, audit.RunnerCacheClear, last.Kind)
++	assert.Equal(t, audit.OutcomeSuccess, last.Outcome)
++	meta, ok := last.Metadata.(audit.RunnerCacheClearMetadata)
++	require.True(t, ok)
++	assert.Equal(t, requestID, meta.RequestID)
++	assert.Equal(t, "completed", meta.Phase)
++	assert.Equal(t, "all", meta.Scope)
++
++	// A duplicated delivery of the same confirmation is idempotent.
++	assert.Equal(t, http.StatusNoContent, report(&runners.CacheCleanupProgress{
++		RequestID: requestID,
++		Status:    db.RunnerCacheCleanupDone,
++	}))
++	assert.Equal(t, 1, recorder.completionCount())
++
++	// A newer request supersedes the old one: its late confirmation is ignored
++	// and the newer request stays pending.
++	newID, err := store.RequestRunnerCacheCleanup(runner)
++	require.NoError(t, err)
++	require.NotEqual(t, requestID, newID)
++	assert.Equal(t, http.StatusNoContent, report(&runners.CacheCleanupProgress{
++		RequestID: requestID,
++		Status:    db.RunnerCacheCleanupDone,
++	}))
++	assert.Equal(t, string(db.RunnerCacheCleanupWaiting), getStatus())
++	assert.Equal(t, 1, recorder.completionCount(), "stale confirmation must not complete the newer request")
++
++	// Invalid statuses are rejected without touching state.
++	assert.Equal(t, http.StatusNoContent, report(&runners.CacheCleanupProgress{
++		RequestID: newID,
++		Status:    db.RunnerCacheCleanupStatus("bogus"),
++	}))
++	assert.Equal(t, string(db.RunnerCacheCleanupWaiting), getStatus())
++
++	// The matching confirmation completes the newer request.
++	assert.Equal(t, http.StatusNoContent, report(&runners.CacheCleanupProgress{
++		RequestID: newID,
++		Status:    db.RunnerCacheCleanupDone,
++	}))
++	assert.Equal(t, string(db.RunnerCacheCleanupDone), getStatus())
++	assert.Equal(t, 2, recorder.completionCount())
++}
+diff --git a/db/Migration.go b/db/Migration.go
+index 8b85c5a3..8c0327dd 100644
+--- a/db/Migration.go
++++ b/db/Migration.go
+@@ -145,6 +145,7 @@ func GetMigrations(dialect string) []Migration {
+ 		{Version: "2.20.9"},
+ 		{Version: "2.20.10"},
+ 		{Version: "2.20.11"},
++		{Version: "2.20.12"},
+ 	}
+ 
+ 	return append(initScripts, commonScripts...)
+diff --git a/db/Runner.go b/db/Runner.go
+index 9b0d4f8e..06ae2dc1 100644
+--- a/db/Runner.go
++++ b/db/Runner.go
+@@ -18,6 +18,46 @@ const (
+ 	RunnerStatusOffline RunnerStatus = "offline"
+ )
+ 
++// RunnerCacheCleanupStatus is the durable state of a runner cache cleanup
++// request. A cleanup is a confirmable, at-least-once operation: the server
++// keeps the request in one of the active states until the runner reports a
++// successful deletion carrying the matching request ID.
++type RunnerCacheCleanupStatus string
++
++const (
++	// RunnerCacheCleanupWaiting means the request was accepted but the runner
++	// still has in-scope jobs (running or queued) using the cache directories.
++	// The runner does not accept new matching jobs while in this state.
++	RunnerCacheCleanupWaiting RunnerCacheCleanupStatus = "waiting"
++	// RunnerCacheCleanupCleaning means the runner is deleting the cache
++	// directories of the request scope.
++	RunnerCacheCleanupCleaning RunnerCacheCleanupStatus = "cleaning"
++	// RunnerCacheCleanupFailed means the last deletion attempt failed. The
++	// runner keeps refusing new jobs and retries the deletion automatically.
++	RunnerCacheCleanupFailed RunnerCacheCleanupStatus = "failed"
++	// RunnerCacheCleanupDone means the runner confirmed a successful deletion
++	// for the request. It is kept on the row as the result of the latest
++	// request until a new one supersedes it.
++	RunnerCacheCleanupDone RunnerCacheCleanupStatus = "done"
++)
++
++// Valid reports whether the value is a cleanup state the API accepts.
++func (s RunnerCacheCleanupStatus) Valid() bool {
++	switch s {
++	case RunnerCacheCleanupWaiting, RunnerCacheCleanupCleaning, RunnerCacheCleanupFailed, RunnerCacheCleanupDone:
++		return true
++	default:
++		return false
++	}
++}
++
++// IsActive reports whether a cleanup is still pending (waiting for jobs,
++// deleting, or retrying after a failure). A runner with an active cleanup is
++// excluded from task dispatch.
++func (s RunnerCacheCleanupStatus) IsActive() bool {
++	return s == RunnerCacheCleanupWaiting || s == RunnerCacheCleanupCleaning || s == RunnerCacheCleanupFailed
++}
++
+ type RunnerTagFilterMode string
+ 
+ const (
+@@ -40,6 +80,18 @@ type Runner struct {
+ 	Touched           *time.Time `db:"touched" json:"touched"`
+ 	CleaningRequested *time.Time `db:"cleaning_requested" json:"cleaning_requested"`
+ 
++	// Cache cleanup request state. A DELETE .../cache request does not delete
++	// anything itself: it creates a cleanup request identified by
++	// CleaningRequestID in state RunnerCacheCleanupWaiting. The polled runner
++	// drains its in-scope jobs, performs the deletion and confirms the result
++	// with the same request ID. CleaningStatus stays active until that
++	// confirmation, so restarts and poll retries resume the request and a
++	// late confirmation of an older request cannot finish a newer one.
++	CleaningRequestID  *string                   `db:"cleaning_request_id" json:"cleaning_request_id"`
++	CleaningStatus     *string                   `db:"cleaning_status" json:"cleaning_status"`
++	CleaningError      *string                   `db:"cleaning_error" json:"cleaning_error"`
++	CleaningUpdatedAt  *time.Time                `db:"cleaning_updated_at" json:"cleaning_updated_at"`
++
+ 	// StartedAt is the runner process's start time, reported by the runner on
+ 	// every poll (X-Runner-Started-At header) and persisted next to Touched.
+ 	// It changes on every restart, which is how the server detects that a
+@@ -107,6 +159,23 @@ func (r *Runner) FillStatus(now time.Time, offlineTimeout time.Duration) {
+ 	}
+ }
+ 
++// CacheCleanupActive reports whether a cleanup request is currently in
++// progress (waiting for jobs, deleting or retrying after a failure). Such a
++// runner is paused for new task dispatch.
++func (r Runner) CacheCleanupActive() bool {
++	return r.CleaningStatus != nil && RunnerCacheCleanupStatus(*r.CleaningStatus).IsActive()
++}
++
++// CacheCleanupScope returns "project" for a project runner (only its project
++// directory is deleted) and "all" for a global runner (the whole cache
++// directory is deleted, preserving the historical full-cache semantics).
++func (r Runner) CacheCleanupScope() string {
++	if r.ProjectID != nil {
++		return "project"
++	}
++	return "all"
++}
++
+ type RunnerTag struct {
+ 	Tag             string `db:"-" json:"tag"`
+ 	NumberOfRunners int    `db:"-" json:"number_of_runners"`
+diff --git a/db/Store.go b/db/Store.go
+index fec4e931..9c893b5b 100644
+--- a/db/Store.go
++++ b/db/Store.go
+@@ -530,7 +530,18 @@ type RunnerManager interface {
+ 	// registration token hash and its expiry.
+ 	ResetRunnerRegistration(runnerID int, registrationTokenHash string, expiresAt time.Time) error
+ 	TouchRunner(runner Runner) (err error)
+-	ClearRunnerCache(runner Runner) (err error)
++	// RequestRunnerCacheCleanup opens a new confirmable cache cleanup request
++	// for the runner, superseding any previous one. The runner row moves to
++	// RunnerCacheCleanupWaiting and the generated request ID is returned; the
++	// runner must echo it on its completion report.
++	RequestRunnerCacheCleanup(runner Runner) (requestID string, err error)
++	// ReportRunnerCacheCleanup applies a runner-reported cleanup state, but
++	// only when requestID matches the request currently stored on the row:
++	// a late confirmation of an older request is ignored. Applied is false
++	// when no row matched (unknown/stale request) and true when the state was
++	// persisted (including idempotent re-reports of the same state). A
++	// "done" report is accepted exactly once per request.
++	ReportRunnerCacheCleanup(runner Runner, requestID string, status RunnerCacheCleanupStatus, failureReason string) (applied bool, err error)
+ 	GetRunnerTags(projectID int) ([]RunnerTag, error)
+ 	GetGlobalRunnerTags() ([]RunnerTag, error)
+ 	GetRunnerCount() (int, error)
+diff --git a/db/sql/global_runner.go b/db/sql/global_runner.go
+index 004ab5c6..09fe1de0 100644
+--- a/db/sql/global_runner.go
++++ b/db/sql/global_runner.go
+@@ -6,6 +6,7 @@ import (
+ 
+ 	"github.com/Masterminds/squirrel"
+ 	"github.com/semaphoreui/semaphore/db"
++	"github.com/semaphoreui/semaphore/pkg/random"
+ 	"github.com/semaphoreui/semaphore/pkg/tz"
+ )
+ 
+@@ -117,22 +118,117 @@ func (d *SqlDb) DeleteGlobalRunner(runnerID int) (err error) {
+ 	return
+ }
+ 
+-func (d *SqlDb) ClearRunnerCache(runner db.Runner) (err error) {
++// maxRunnerCacheCleanupErrorLen matches the cleaning_error column length.
++const maxRunnerCacheCleanupErrorLen = 512
++
++func truncateRunnerCacheCleanupError(message string) string {
++	if len(message) <= maxRunnerCacheCleanupErrorLen {
++		return message
++	}
++	return message[:maxRunnerCacheCleanupErrorLen]
++}
++
++// runnerScopeCondition renders the project-scope guard used by every cleanup
++// update: global runners are matched by id alone, project runners also by
++// their project so a runner from another project can never touch the row.
++func runnerScopeCondition(runner db.Runner) (condition string, args []any) {
+ 	if runner.ProjectID == nil {
+-		_, err = d.exec(
+-			"update `runner` set `cleaning_requested`=? where id=?",
+-			tz.Now(),
+-			runner.ID)
+-		return
++		return "id=? and project_id is null", []any{runner.ID}
+ 	}
++	return "id=? and project_id=?", []any{runner.ID, *runner.ProjectID}
++}
+ 
+-	_, err = d.exec(
+-		"update `runner` set `cleaning_requested`=? where id=? and project_id=?",
+-		tz.Now(),
+-		runner.ID,
+-		runner.ProjectID)
++func (d *SqlDb) RequestRunnerCacheCleanup(runner db.Runner) (requestID string, err error) {
++	requestID = random.String(32)
++	now := tz.Now()
+ 
+-	return
++	condition, args := runnerScopeCondition(runner)
++	query := "update `runner` set `cleaning_request_id`=?, `cleaning_status`=?, " +
++		"`cleaning_error`=null, `cleaning_requested`=?, `cleaning_updated_at`=? where " + condition
++
++	updateArgs := append([]any{requestID, string(db.RunnerCacheCleanupWaiting), now, now}, args...)
++
++	res, err := d.exec(query, updateArgs...)
++	if err != nil {
++		return "", err
++	}
++
++	affected, err := res.RowsAffected()
++	if err != nil {
++		return "", err
++	}
++	if affected == 0 {
++		return "", db.ErrNotFound
++	}
++
++	return requestID, nil
++}
++
++func (d *SqlDb) ReportRunnerCacheCleanup(runner db.Runner, requestID string, status db.RunnerCacheCleanupStatus, failureReason string) (applied bool, err error) {
++	if requestID == "" || !status.Valid() {
++		return false, nil
++	}
++
++	now := tz.Now()
++	condition, args := runnerScopeCondition(runner)
++
++	var query string
++	updateArgs := make([]any, 0, 7)
++
++	switch status {
++	case db.RunnerCacheCleanupDone:
++		// A successful confirmation completes the request exactly once:
++		// rows already in "done" (e.g. a retried delivery of the same
++		// confirmation) do not match and produce no second completion.
++		query = "update `runner` set `cleaning_status`=?, `cleaning_error`=null, " +
++			"`cleaning_updated_at`=? where " + condition +
++			" and cleaning_request_id=? and cleaning_status in (?, ?, ?)"
++		updateArgs = append(updateArgs, string(status), now)
++		updateArgs = append(updateArgs, args...)
++		updateArgs = append(updateArgs, requestID,
++			string(db.RunnerCacheCleanupWaiting),
++			string(db.RunnerCacheCleanupCleaning),
++			string(db.RunnerCacheCleanupFailed))
++	case db.RunnerCacheCleanupCleaning:
++		// waiting -> cleaning, and idempotent re-reports from cleaning or
++		// failed (a new attempt after a failure reports "cleaning" again).
++		query = "update `runner` set `cleaning_status`=?, `cleaning_updated_at`=? where " +
++			condition +
++			" and cleaning_request_id=? and cleaning_status in (?, ?, ?)"
++		updateArgs = append(updateArgs, string(status), now)
++		updateArgs = append(updateArgs, args...)
++		updateArgs = append(updateArgs, requestID,
++			string(db.RunnerCacheCleanupWaiting),
++			string(db.RunnerCacheCleanupCleaning),
++			string(db.RunnerCacheCleanupFailed))
++	case db.RunnerCacheCleanupFailed:
++		query = "update `runner` set `cleaning_status`=?, `cleaning_error`=?, `cleaning_updated_at`=? where " +
++			condition +
++			" and cleaning_request_id=? and cleaning_status in (?, ?)"
++		updateArgs = append(updateArgs, string(status), truncateRunnerCacheCleanupError(failureReason), now)
++		updateArgs = append(updateArgs, args...)
++		updateArgs = append(updateArgs, requestID,
++			string(db.RunnerCacheCleanupCleaning),
++			string(db.RunnerCacheCleanupFailed))
++	case db.RunnerCacheCleanupWaiting:
++		query = "update `runner` set `cleaning_updated_at`=? where " + condition +
++			" and cleaning_request_id=? and cleaning_status=?"
++		updateArgs = append(updateArgs, now)
++		updateArgs = append(updateArgs, args...)
++		updateArgs = append(updateArgs, requestID, string(db.RunnerCacheCleanupWaiting))
++	}
++
++	res, err := d.exec(query, updateArgs...)
++	if err != nil {
++		return false, err
++	}
++
++	affected, err := res.RowsAffected()
++	if err != nil {
++		return false, err
++	}
++
++	return affected > 0, nil
+ }
+ 
+ func (d *SqlDb) TouchRunner(runner db.Runner) (err error) {
+diff --git a/pro/go.mod b/pro/go.mod
+index d66936af..3d16d2dd 100644
+--- a/pro/go.mod
++++ b/pro/go.mod
+@@ -58,10 +58,10 @@ require (
+ 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
+ 	gopkg.in/warnings.v0 v0.1.2 // indirect
+ 	gopkg.in/yaml.v3 v3.0.1 // indirect
+-	modernc.org/libc v1.75.6 // indirect
++	modernc.org/libc v1.75.7 // indirect
+ 	modernc.org/mathutil v1.7.1 // indirect
+ 	modernc.org/memory v1.12.1 // indirect
+-	modernc.org/sqlite v1.58.0 // indirect
++	modernc.org/sqlite v1.59.0 // indirect
+ )
+ 
+ replace github.com/semaphoreui/semaphore => ../
+diff --git a/pro/go.sum b/pro/go.sum
+index 1561b0b4..5fe7008c 100644
+--- a/pro/go.sum
++++ b/pro/go.sum
+@@ -201,6 +201,8 @@ modernc.org/goabi0 v0.2.0 h1:HvEowk7LxcPd0eq6mVOAEMai46V+i7Jrj13t4AzuNks=
+ modernc.org/goabi0 v0.2.0/go.mod h1:CEFRnnJhKvWT1c1JTI3Avm+tgOWbkOu5oPA8eH8LnMI=
+ modernc.org/libc v1.75.6 h1:yKk8qo+Di4gkmvRboK8ocCqH22FiUCR6jRy2OwtCRus=
+ modernc.org/libc v1.75.6/go.mod h1:bO5o2ztHxBb2rjz0PgdHN0sSMw57CgxGFLZ3Qd/QpVQ=
++modernc.org/libc v1.75.7 h1:o3DTP9/0p9pKmY2WCKQaySW6wIiZhNM7wc2lUoyhfew=
++modernc.org/libc v1.75.7/go.mod h1:bO5o2ztHxBb2rjz0PgdHN0sSMw57CgxGFLZ3Qd/QpVQ=
+ modernc.org/mathutil v1.7.1 h1:GCZVGXdaN8gTqB1Mf/usp1Y/hSqgI2vAGGP4jZMCxOU=
+ modernc.org/mathutil v1.7.1/go.mod h1:4p5IwJITfppl0G4sUEDtCr4DthTaT47/N3aT6MhfgJg=
+ modernc.org/memory v1.12.1 h1:nFMiWrpStgZczNl6XI9GnIk/rWhYIyHGUaR04pGbp9g=
+@@ -211,6 +213,8 @@ modernc.org/sortutil v1.2.1 h1:+xyoGf15mM3NMlPDnFqrteY07klSFxLElE2PVuWIJ7w=
+ modernc.org/sortutil v1.2.1/go.mod h1:7ZI3a3REbai7gzCLcotuw9AC4VZVpYMjDzETGsSMqJE=
+ modernc.org/sqlite v1.58.0 h1:38u40/bwkfM7f0Myhosl+SEMltSDxnGdQf8o6Kjmys0=
+ modernc.org/sqlite v1.58.0/go.mod h1:rsD2CckafgObKC4DhBlGBf+RiHxkc3hINGt1Xw32tVY=
++modernc.org/sqlite v1.59.0 h1:X1es1GpqBlS/5T+vbM4HLUdaa8OtQx468DF2vrx+38A=
++modernc.org/sqlite v1.59.0/go.mod h1:+paeT2A3iPRHkQDwG7oA6Tk0zQd5woMEI8q7orfry8k=
+ modernc.org/strutil v1.2.1 h1:UneZBkQA+DX2Rp35KcM69cSsNES9ly8mQWD71HKlOA0=
+ modernc.org/strutil v1.2.1/go.mod h1:EHkiggD70koQxjVdSBM3JKM7k6L0FbGE5eymy9i3B9A=
+ modernc.org/token v1.1.0 h1:Xl7Ap9dKaEs5kLoOQeQmPWevfnk/DM5qcLcYlA8ys6Y=
+diff --git a/services/audit/catalog.go b/services/audit/catalog.go
+index a3dfa855..dabebfc1 100644
+--- a/services/audit/catalog.go
++++ b/services/audit/catalog.go
+@@ -142,7 +142,7 @@ func Catalog() []Entry {
+ 		{Kind: RunnerLifecycleRegister, Type: TypeCreation, Metadata: RunnerRegisterMetadata{}, Reasons: []Reason{ReasonInvalidRegistrationToken}},
+ 		{Kind: RunnerLifecycleUnregister, Type: TypeDeletion},
+ 		{Kind: RunnerCredentialRotate, Type: TypeChange},
+-		{Kind: RunnerCacheClear, Type: TypeDeletion},
++		{Kind: RunnerCacheClear, Type: TypeDeletion, Metadata: RunnerCacheClearMetadata{}},
+ 		{Kind: RunnerProgressReject, Type: TypeDenied, Reasons: []Reason{ReasonInvalidStatus}},
+ 
+ 		{Kind: SystemSettingsUpdate, Type: TypeChange, Metadata: SettingsMetadata{}},
+diff --git a/services/audit/metadata.go b/services/audit/metadata.go
+index 7752b855..faa49652 100644
+--- a/services/audit/metadata.go
++++ b/services/audit/metadata.go
+@@ -173,3 +173,12 @@ type TaskMetadata struct {
+ type RunnerRegisterMetadata struct {
+ 	Token string `json:"token"`
+ }
++
++// RunnerCacheClearMetadata is carried by runner.cache/clear events. Phase is
++// "requested" when an admin/API opens a cleanup request and "completed" when
++// the runner has confirmed the actual deletion for the same RequestID.
++type RunnerCacheClearMetadata struct {
++	RequestID string `json:"request_id"`
++	Scope     string `json:"scope"`
++	Phase     string `json:"phase"`
++}
+diff --git a/services/runners/job_pool.go b/services/runners/job_pool.go
+index 9702e1de..7f5f878e 100644
+--- a/services/runners/job_pool.go
++++ b/services/runners/job_pool.go
+@@ -67,6 +67,11 @@ type JobPool struct {
+ 
+ 	processing int32
+ 
++	// cleanup is the state machine of the pending cache cleanup request (if
++	// any). While it is active the pool does not start any queued job and
++	// rejects NewJobs from poll responses.
++	cleanup cacheCleanup
++
+ 	// provider is the strategy that produces per-task Executors. Built once at
+ 	// startup from the runner's executor config. Nil when initialisation failed —
+ 	// dispatch refuses cleanly in that case instead of panicking on first task.
+@@ -194,6 +199,25 @@ func (p *JobPool) enqueue(j *job) {
+ 	p.queue = append(p.queue, j)
+ }
+ 
++// enqueueFront puts a job back at the head of the queue under the lock. Used
++// when a dequeued job cannot start yet (e.g. a cache cleanup is in progress)
++// so its FIFO position is not lost.
++func (p *JobPool) enqueueFront(j *job) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	p.queue = append([]*job{j}, p.queue...)
++}
++
++// clearQueue drops every queued job under the lock and returns how many were
++// dropped. Jobs already running are never touched.
++func (p *JobPool) clearQueue() int {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	n := len(p.queue)
++	p.queue = make([]*job, 0)
++	return n
++}
++
+ // dequeue removes and returns the job at the front of the queue. The second
+ // return value is false when the queue is empty.
+ func (p *JobPool) dequeue() (*job, bool) {
+@@ -335,6 +359,16 @@ func (p *JobPool) Run() {
+ 				break
+ 			}
+ 
++			// A pending cache cleanup pauses this runner: already running jobs
++			// finish normally, but a queued job must not create repository or
++			// HOME directories that are about to be deleted. Keep it at the
++			// head of the queue until the cleanup is confirmed and the server
++			// resumes dispatching to this runner.
++			if p.cleanup.active() {
++				p.enqueueFront(t)
++				break
++			}
++
+ 			if t.status == task_logger.TaskFailStatus {
+ 				//delete failed TaskRunner from queue
+ 				log.WithFields(log.Fields{
+@@ -449,6 +483,11 @@ func (p *JobPool) Run() {
+ 					fmt.Println("Runner connected")
+ 				}
+ 
++				// Advance a pending cache cleanup independently of job polls:
++				// wait for the last job, delete, retry on failure. The resulting
++				// state rides on the next progress PUT above.
++				p.cleanup.tick(p)
++
+ 				if util.Config.Runner.OneOff && ok && p.runningJobsCount() > 0 && !p.hasRunningJobs() {
+ 					os.Exit(0)
+ 				}
+@@ -468,7 +507,8 @@ func (p *JobPool) sendProgress() (ok bool) {
+ 	url := util.Config.WebHost + "/api/internal/runners"
+ 
+ 	body := RunnerProgress{
+-		Jobs: nil,
++		Jobs:         nil,
++		CacheCleanup: p.cleanup.progress(),
+ 	}
+ 
+ 	for id, j := range p.snapshotRunningJobs() {
+@@ -849,27 +889,26 @@ func (p *JobPool) checkNewJobs() {
+ 	}
+ 
+ 	log.WithFields(log.Fields{
+-		"context":      "checking_new_jobs",
+-		"current_jobs": len(response.CurrentJobs),
+-		"new_jobs":     len(response.NewJobs),
+-		"clear_cache":  response.ClearCache,
+-		"access_keys":  len(response.AccessKeys),
++		"context":       "checking_new_jobs",
++		"current_jobs":  len(response.CurrentJobs),
++		"new_jobs":      len(response.NewJobs),
++		"cache_cleanup": response.CacheCleanup != nil,
++		"access_keys":   len(response.AccessKeys),
+ 	}).Debug("Received runner state from the server")
+ 
+-	if response.ClearCache {
+-		if response.CacheCleanProjectID == nil {
+-			if err2 := util.Config.ClearTmpDir(); err2 != nil {
+-				log.WithError(err2).WithFields(log.Fields{
+-					"context": "checking_new_jobs",
+-				}).Error("failed to clear tmp directory")
+-			}
+-		} else {
+-			if err2 := util.Config.ClearProjectTmpDir(*response.CacheCleanProjectID); err2 != nil {
+-				log.WithError(err2).WithFields(log.Fields{
+-					"context":    "checking_new_jobs",
+-					"project_id": *response.CacheCleanProjectID,
+-				}).Error("failed to clear project tmp directory")
+-			}
++	// Arm/disarm the confirmable cleanup request. While it is pending the
++	// runner must not start jobs that were accepted before the request (they
++	// have not touched the cache yet and the server requeues them for other
++	// runners), and it must not accept any NewJobs delivered in this poll.
++	p.cleanup.handleDirective(response.CacheCleanup)
++
++	if response.CacheCleanup != nil {
++		if dropped := p.clearQueue(); dropped > 0 {
++			log.WithFields(log.Fields{
++				"context":         "checking_new_jobs",
++				"dropped_jobs":    dropped,
++				"cleanup_request": response.CacheCleanup.RequestID,
++			}).Info("Discarding queued jobs while cache cleanup is pending; the server will reassign them")
+ 		}
+ 	}
+ 
+@@ -932,6 +971,22 @@ func (p *JobPool) checkNewJobs() {
+ 		}
+ 	}
+ 
++	// A runner with a pending cache cleanup is paused. The server is expected
++	// not to send NewJobs in this state, but the check is enforced here as
++	// well so no job can ever be accepted against a pending directive (races
++	// with the request being created between dispatch selection and response
++	// assembly, mixed versions, duplicated in-flight polls).
++	if response.CacheCleanup != nil {
++		if len(response.NewJobs) > 0 {
++			log.WithFields(log.Fields{
++				"context":         "checking_new_jobs",
++				"new_jobs":        len(response.NewJobs),
++				"cleanup_request": response.CacheCleanup.RequestID,
++			}).Debug("Refusing new jobs while a cache cleanup request is pending")
++		}
++		return
++	}
++
+ 	for _, newJob := range response.NewJobs {
+ 		if p.getRunningJob(newJob.Task.ID) != nil {
+ 			log.WithFields(log.Fields{
+diff --git a/services/runners/types.go b/services/runners/types.go
+index b8cce061..424e80d2 100644
+--- a/services/runners/types.go
++++ b/services/runners/types.go
+@@ -22,13 +22,48 @@ type JobData struct {
+ 	HostConfigs         []db.HostConfig `json:"host_configs,omitempty"`
+ }
+ 
++// CacheCleanupScope selects which directories a cleanup request deletes.
++type CacheCleanupScope string
++
++const (
++	// CacheCleanupAll is used by global runners: the whole cache directory
++	// (every project's repositories, inventories and execution HOME) is
++	// deleted.
++	CacheCleanupAll CacheCleanupScope = "all"
++	// CacheCleanupProject is used by project runners: only the owning
++	// project's cache directory is deleted.
++	CacheCleanupProject CacheCleanupScope = "project"
++)
++
++// CacheCleanupDirective is the server->runner instruction that a confirmable
++// cache cleanup request is pending. It is present in every poll response while
++// the request has not been completed with a matching CacheCleanupProgress, so
++// a runner restart or a missed poll simply re-arms the same request. The runner
++// must not accept NewJobs while a directive is present.
++type CacheCleanupDirective struct {
++	RequestID string             `json:"request_id" binding:"required"`
++	Scope     CacheCleanupScope `json:"scope" binding:"required"`
++	ProjectID *int               `json:"project_id,omitempty"`
++}
++
++// CacheCleanupProgress is the runner->server report of a cleanup request.
++// The server applies it only when RequestID matches the request currently
++// stored for the runner; late reports for an older request are discarded.
++// Transitions: waiting -> cleaning -> done, with failed retries between
++// cleaning attempts until done.
++type CacheCleanupProgress struct {
++	RequestID string                        `json:"request_id" binding:"required"`
++	Status    db.RunnerCacheCleanupStatus   `json:"status" binding:"required"`
++	Error     string                        `json:"error,omitempty"`
++}
++
+ type RunnerState struct {
+ 	CurrentJobs []JobState
+ 	NewJobs     []JobData            `json:"new_jobs" binding:"required"`
+ 	AccessKeys  map[int]db.AccessKey `json:"access_keys" binding:"required"`
+ 
+-	ClearCache          bool `json:"clear_cache,omitempty"`
+-	CacheCleanProjectID *int `json:"cache_clean_project_id,omitempty"`
++	// CacheCleanup is set while a cleanup request is pending for this runner.
++	CacheCleanup *CacheCleanupDirective `json:"cache_cleanup,omitempty"`
+ }
+ 
+ type JobState struct {
+@@ -48,6 +83,10 @@ type CommitInfo struct {
+ 
+ type RunnerProgress struct {
+ 	Jobs []JobProgress
++
++	// CacheCleanup reports the current state of the cleanup request this
++	// runner is handling. Absent when the runner has no pending directive.
++	CacheCleanup *CacheCleanupProgress `json:"cache_cleanup,omitempty"`
+ }
+ 
+ // RunnerProgressResponse is the server's reply to a progress report (PUT).
+diff --git a/services/tasks/RemoteJob.go b/services/tasks/RemoteJob.go
+index 34a70da3..66d71d2c 100644
+--- a/services/tasks/RemoteJob.go
++++ b/services/tasks/RemoteJob.go
+@@ -109,11 +109,12 @@ func shuffleRunners(rs []db.Runner) []db.Runner {
+ 	return shuffled
+ }
+ 
+-// selectRunner returns the first runner that is online (see db.Runner.IsOnline)
+-// and has free capacity, or nil when there is none. Offline runners are
+-// excluded outright — dispatching to a silent runner is exactly how tasks used
+-// to hang forever; a task with no online runner stays queued instead and is
+-// retried by the pool.
++// selectRunner returns the first runner that is online (see db.Runner.IsOnline),
++// is not paused for a pending cache cleanup and has free capacity, or nil when
++// there is none. Offline and cleaning runners are excluded outright —
++// dispatching to a silent runner is exactly how tasks used to hang forever; a
++// task with no available runner stays queued instead and is retried by the
++// pool, which also lets a non-cleaning runner take it over.
+ func selectRunner(
+ 	runners []db.Runner,
+ 	now time.Time,
+@@ -125,6 +126,9 @@ func selectRunner(
+ 		if !r.IsOnline(now, offlineTimeout) {
+ 			continue
+ 		}
++		if r.CacheCleanupActive() {
++			continue
++		}
+ 		if r.HasFreeCapacity(busyTasks(r.ID)) {
+ 			return r
+ 		}
+@@ -150,6 +154,8 @@ func runnerExclusionReason(
+ 		return "tag_mismatch"
+ 	case !r.IsOnline(now, offlineTimeout):
+ 		return "offline"
++	case r.CacheCleanupActive():
++		return "cache_cleanup"
+ 	case !r.HasFreeCapacity(runningTasks):
+ 		return "at_capacity"
+ 	default:
+diff --git a/services/tasks/RemoteJob_test.go b/services/tasks/RemoteJob_test.go
+index 1e8dd097..abe86d2d 100644
+--- a/services/tasks/RemoteJob_test.go
++++ b/services/tasks/RemoteJob_test.go
+@@ -24,6 +24,9 @@ func TestRunnerExclusionReason(t *testing.T) {
+ 		{"not default", db.Runner{Active: true, Token: "token", Touched: &recent}, nil, 0, "not_default"},
+ 		{"tag mismatch", db.Runner{Active: true, Token: "token", Tags: []string{"staging"}, Touched: &recent}, &tag, 0, "tag_mismatch"},
+ 		{"offline", db.Runner{Active: true, Token: "token", IsDefault: true}, nil, 0, "offline"},
++		{"cache cleanup", db.Runner{Active: true, Token: "token", IsDefault: true, Touched: &recent, CleaningRequestID: strPtr("req-1"), CleaningStatus: cleanupStatusPtr(db.RunnerCacheCleanupWaiting)}, nil, 0, "cache_cleanup"},
++		{"cache cleanup failed still paused", db.Runner{Active: true, Token: "token", IsDefault: true, Touched: &recent, CleaningRequestID: strPtr("req-1"), CleaningStatus: cleanupStatusPtr(db.RunnerCacheCleanupFailed)}, nil, 0, "cache_cleanup"},
++		{"cache cleanup done", db.Runner{Active: true, Token: "token", IsDefault: true, Touched: &recent, CleaningRequestID: strPtr("req-1"), CleaningStatus: cleanupStatusPtr(db.RunnerCacheCleanupDone)}, nil, 0, ""},
+ 		{"at capacity", db.Runner{Active: true, Token: "token", IsDefault: true, Touched: &recent, MaxParallelTasks: 2}, nil, 2, "at_capacity"},
+ 		{"available", db.Runner{Active: true, Token: "token", IsDefault: true, Touched: &recent}, nil, 10, ""},
+ 		{"webhook runner", db.Runner{Active: true, Token: "token", IsDefault: true, Webhook: "https://runner.example.test"}, nil, 0, ""},
+diff --git a/services/tasks/runner_reconciler.go b/services/tasks/runner_reconciler.go
+index a55b78ab..92d01396 100644
+--- a/services/tasks/runner_reconciler.go
++++ b/services/tasks/runner_reconciler.go
+@@ -70,6 +70,15 @@ func DecideRunnerTaskAction(
+ 		return RunnerTaskFail, "runner restarted and lost the task"
+ 	}
+ 
++	// A runner with a pending cache cleanup is paused for new tasks. Jobs that
++	// were assigned but have not started yet are returned to the queue so a
++	// non-cleaning runner takes them over; already-running jobs stay on this
++	// runner (handled below by the liveness checks) and the cleanup waits for
++	// the last of them to finish.
++	if starting && runner.CacheCleanupActive() {
++		return RunnerTaskRequeue, "runner cache cleanup in progress"
++	}
++
+ 	// A webhook-driven runner may still be booting in response to the dispatch
+ 	// webhook; its heartbeat history (if any) predates this task, so staleness
+ 	// must not requeue a just-dispatched task. Once such a runner reports the
+diff --git a/services/tasks/runner_reconciler_test.go b/services/tasks/runner_reconciler_test.go
+index 2bb28ea1..5a75038b 100644
+--- a/services/tasks/runner_reconciler_test.go
++++ b/services/tasks/runner_reconciler_test.go
+@@ -225,6 +225,30 @@ func TestDecideRunnerTaskAction(t *testing.T) {
+ 			&db.Runner{Touched: ago(time.Minute), StartedAt: ago(2 * time.Hour)},
+ 			RunnerTaskKeep,
+ 		},
++		{
++			"starting task on runner with active cache cleanup",
++			task_logger.TaskStartingStatus, nil,
++			&db.Runner{Touched: ago(10 * time.Second), CleaningRequestID: strPtr("req-1"), CleaningStatus: cleanupStatusPtr(db.RunnerCacheCleanupWaiting)},
++			RunnerTaskRequeue,
++		},
++		{
++			"waiting task on runner cleaning cache",
++			task_logger.TaskWaitingStatus, nil,
++			&db.Runner{Touched: ago(10 * time.Second), CleaningRequestID: strPtr("req-1"), CleaningStatus: cleanupStatusPtr(db.RunnerCacheCleanupCleaning)},
++			RunnerTaskRequeue,
++		},
++		{
++			"running task stays on runner while cache cleanup waits for it",
++			task_logger.TaskRunningStatus, ago(time.Hour),
++			&db.Runner{Touched: ago(10 * time.Second), StartedAt: ago(2 * time.Hour), CleaningRequestID: strPtr("req-1"), CleaningStatus: cleanupStatusPtr(db.RunnerCacheCleanupWaiting)},
++			RunnerTaskKeep,
++		},
++		{
++			"completed cleanup does not block starting task",
++			task_logger.TaskStartingStatus, nil,
++			&db.Runner{Touched: ago(10 * time.Second), CleaningRequestID: strPtr("req-1"), CleaningStatus: cleanupStatusPtr(db.RunnerCacheCleanupDone)},
++			RunnerTaskKeep,
++		},
+ 		{
+ 			"runner deleted, starting task",
+ 			task_logger.TaskStartingStatus, nil,
+@@ -342,6 +366,42 @@ func TestSelectRunner(t *testing.T) {
+ 	t.Run("no runners returns nil", func(t *testing.T) {
+ 		assert.Nil(t, selectRunner(nil, now, offlineTimeout, noBusy))
+ 	})
++
++	t.Run("runner with active cache cleanup skipped; other runner takes the task", func(t *testing.T) {
++		cleaningRunner := db.Runner{
++			ID:                  10,
++			Touched:             ago(10 * time.Second),
++			MaxParallelTasks:    0,
++			CleaningRequestID:   strPtr("req-1"),
++			CleaningStatus:      cleanupStatusPtr(db.RunnerCacheCleanupWaiting),
++		}
++		otherOnline := online
++		r := selectRunner([]db.Runner{cleaningRunner, otherOnline}, now, offlineTimeout, noBusy)
++		require.NotNil(t, r)
++		assert.Equal(t, otherOnline.ID, r.ID)
++
++		// Only the cleaning runner is available: no dispatch, task stays queued.
++		assert.Nil(t, selectRunner([]db.Runner{cleaningRunner}, now, offlineTimeout, noBusy))
++	})
++
++	t.Run("runner with completed cleanup selectable", func(t *testing.T) {
++		doneRunner := db.Runner{
++			ID:                11,
++			Touched:           ago(10 * time.Second),
++			CleaningRequestID: strPtr("req-1"),
++			CleaningStatus:    cleanupStatusPtr(db.RunnerCacheCleanupDone),
++		}
++		r := selectRunner([]db.Runner{doneRunner}, now, offlineTimeout, noBusy)
++		require.NotNil(t, r)
++		assert.Equal(t, doneRunner.ID, r.ID)
++	})
++}
++
++func strPtr(v string) *string { return &v }
++
++func cleanupStatusPtr(s db.RunnerCacheCleanupStatus) *string {
++	v := string(s)
++	return &v
+ }
+ 
+ func TestRequeueTaskRunnerOffline(t *testing.T) {
+diff --git a/web/src/lang/en.js b/web/src/lang/en.js
+index 377dde25..39f05988 100644
+--- a/web/src/lang/en.js
++++ b/web/src/lang/en.js
+@@ -165,6 +165,12 @@ export default {
+   clear_cache: 'Clear cache',
+   clear_cache_message:
+     'Delete all cache files related to this project. This action is irreversible.',
++  cleanup_waiting:
++    'Cache cleanup pending: waiting for the tasks already assigned to this runner to finish. The runner is not accepting new tasks.',
++  cleanup_running: 'Cleaning cache directories...',
++  cleanup_failed:
++    'Cache cleanup failed; the runner stays paused and retries automatically. Last error:',
++  cleanup_done: 'Cache cleanup completed at',
+ 
+   name2: 'Name *',
+   title: 'Title *',
+diff --git a/web/src/lang/zh_cn.js b/web/src/lang/zh_cn.js
+index a8ba8d5a..776382aa 100644
+--- a/web/src/lang/zh_cn.js
++++ b/web/src/lang/zh_cn.js
+@@ -124,6 +124,10 @@ export default {
+ 
+   clear_cache: '清除缓存',
+   clear_cache_message: '删除与此项目相关的所有缓存文件。此操作不可逆。',
++  cleanup_waiting: '缓存清理等待中：等待已分配给该 Runner 的任务结束，期间不再接收新任务。',
++  cleanup_running: '正在清理缓存目录……',
++  cleanup_failed: '缓存清理失败，Runner 将保持暂停并自动重试。最近错误：',
++  cleanup_done: '缓存清理完成于',
+ 
+   name2: '名称 *',
+   title: '标题 *',
+diff --git a/web/src/views/Runners.vue b/web/src/views/Runners.vue
+index 0b5fb40c..cc2c8978 100644
+--- a/web/src/views/Runners.vue
++++ b/web/src/views/Runners.vue
+@@ -613,7 +613,7 @@ semaphore runner start --config ./config.runner.json</pre
+             <v-icon>mdi-pencil</v-icon>
+           </v-btn>
+ 
+-          <v-tooltip v-if="item.project_id != null || projectId == null" bottom :max-width="150">
++          <v-tooltip v-if="item.project_id != null || projectId == null" bottom :max-width="220">
+             <template v-slot:activator="{ on, attrs }">
+               <v-btn
+                 v-bind="attrs"
+@@ -621,7 +621,7 @@ semaphore runner start --config ./config.runner.json</pre
+                 icon
+                 class="mr-1"
+                 @click="clearCache(item)"
+-                :disabled="item.project_id == null && !isAdmin"
++                :disabled="(item.project_id == null && !isAdmin) || isCleanupActive(item)"
+               >
+                 <v-icon>mdi-broom</v-icon>
+               </v-btn>
+@@ -630,11 +630,18 @@ semaphore runner start --config ./config.runner.json</pre
+               {{ $t('clear_cache') }}
+             </div>
+ 
+-            <div v-if="item.cleaning_requested" style="font-size: 12px; line-height: 1.2">
+-              <span v-if="item.touched < item.cleaning_requested">
+-                Already requested {{ item.cleaning_requested | formatDate }}.
+-              </span>
+-              <span v-else> Last cleaned {{ item.cleaning_requested | formatDate }}. </span>
++            <div v-if="runnerCleanupState(item) === 'waiting'" style="font-size: 12px; line-height: 1.2">
++              {{ $t('cleanup_waiting') }}
++            </div>
++            <div v-else-if="runnerCleanupState(item) === 'cleaning'" style="font-size: 12px; line-height: 1.2">
++              {{ $t('cleanup_running') }}
++            </div>
++            <div v-else-if="runnerCleanupState(item) === 'failed'" style="font-size: 12px; line-height: 1.2">
++              <div>{{ $t('cleanup_failed') }}</div>
++              <div v-if="item.cleaning_error" style="word-break: break-word">{{ item.cleaning_error }}</div>
++            </div>
++            <div v-else-if="runnerCleanupState(item) === 'done' && item.cleaning_updated_at" style="font-size: 12px; line-height: 1.2">
++              {{ $t('cleanup_done') }} {{ item.cleaning_updated_at | formatDate }}
+             </div>
+           </v-tooltip>
+         </div>
+@@ -674,6 +681,17 @@ export default {
+     },
+   },
+ 
++  mounted() {
++    // A cache cleanup finishes asynchronously on the runner; refresh the list
++    // while any runner has a pending request so the UI walks waiting ->
++    // cleaning -> done (or failed) on its own.
++    this.cleanupRefreshTimer = setInterval(this.refreshActiveCleanups, 5000);
++  },
++
++  beforeDestroy() {
++    clearInterval(this.cleanupRefreshTimer);
++  },
++
+   computed: {
+     webHost() {
+       return this.systemInfo?.web_host || window.location.origin;
+@@ -826,6 +844,33 @@ ${advancedOptions}-d semaphoreui/runner:${this.version}`;
+       return (Number.isInteger(n) && n > 0) || this.$t('runnerCheckIntervalInvalid');
+     },
+ 
++    // runnerCleanupState maps the durable runner.cleaning_status to one of
++    // waiting | cleaning | failed | done, or null when no cleanup was ever
++    // requested.
++    runnerCleanupState(runner) {
++      if (!runner || !runner.cleaning_request_id) {
++        return null;
++      }
++      return runner.cleaning_status || 'waiting';
++    },
++
++    isCleanupActive(runner) {
++      const state = this.runnerCleanupState(runner);
++      return state === 'waiting' || state === 'cleaning' || state === 'failed';
++    },
++
++    async refreshActiveCleanups() {
++      if (!this.items || !this.items.some((item) => this.isCleanupActive(item))) {
++        return;
++      }
++      try {
++        await this.loadItems();
++      } catch (e) {
++        // The next interval tick retries; cleanup state is server-side and
++        // does not depend on this refresh.
++      }
++    },
++
+     async clearCache(runner) {
+       const projectId = this.getProjectIdOfItem(runner.id);
+ 

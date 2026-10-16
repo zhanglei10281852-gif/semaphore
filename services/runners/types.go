@@ -22,13 +22,48 @@ type JobData struct {
 	HostConfigs         []db.HostConfig `json:"host_configs,omitempty"`
 }
 
+// CacheCleanupScope selects which directories a cleanup request deletes.
+type CacheCleanupScope string
+
+const (
+	// CacheCleanupAll is used by global runners: the whole cache directory
+	// (every project's repositories, inventories and execution HOME) is
+	// deleted.
+	CacheCleanupAll CacheCleanupScope = "all"
+	// CacheCleanupProject is used by project runners: only the owning
+	// project's cache directory is deleted.
+	CacheCleanupProject CacheCleanupScope = "project"
+)
+
+// CacheCleanupDirective is the server->runner instruction that a confirmable
+// cache cleanup request is pending. It is present in every poll response while
+// the request has not been completed with a matching CacheCleanupProgress, so
+// a runner restart or a missed poll simply re-arms the same request. The runner
+// must not accept NewJobs while a directive is present.
+type CacheCleanupDirective struct {
+	RequestID string             `json:"request_id" binding:"required"`
+	Scope     CacheCleanupScope `json:"scope" binding:"required"`
+	ProjectID *int               `json:"project_id,omitempty"`
+}
+
+// CacheCleanupProgress is the runner->server report of a cleanup request.
+// The server applies it only when RequestID matches the request currently
+// stored for the runner; late reports for an older request are discarded.
+// Transitions: waiting -> cleaning -> done, with failed retries between
+// cleaning attempts until done.
+type CacheCleanupProgress struct {
+	RequestID string                        `json:"request_id" binding:"required"`
+	Status    db.RunnerCacheCleanupStatus   `json:"status" binding:"required"`
+	Error     string                        `json:"error,omitempty"`
+}
+
 type RunnerState struct {
 	CurrentJobs []JobState
 	NewJobs     []JobData            `json:"new_jobs" binding:"required"`
 	AccessKeys  map[int]db.AccessKey `json:"access_keys" binding:"required"`
 
-	ClearCache          bool `json:"clear_cache,omitempty"`
-	CacheCleanProjectID *int `json:"cache_clean_project_id,omitempty"`
+	// CacheCleanup is set while a cleanup request is pending for this runner.
+	CacheCleanup *CacheCleanupDirective `json:"cache_cleanup,omitempty"`
 }
 
 type JobState struct {
@@ -48,6 +83,10 @@ type CommitInfo struct {
 
 type RunnerProgress struct {
 	Jobs []JobProgress
+
+	// CacheCleanup reports the current state of the cleanup request this
+	// runner is handling. Absent when the runner has no pending directive.
+	CacheCleanup *CacheCleanupProgress `json:"cache_cleanup,omitempty"`
 }
 
 // RunnerProgressResponse is the server's reply to a progress report (PUT).

@@ -142,7 +142,7 @@ func Catalog() []Entry {
 		{Kind: RunnerLifecycleRegister, Type: TypeCreation, Metadata: RunnerRegisterMetadata{}, Reasons: []Reason{ReasonInvalidRegistrationToken}},
 		{Kind: RunnerLifecycleUnregister, Type: TypeDeletion},
 		{Kind: RunnerCredentialRotate, Type: TypeChange},
-		{Kind: RunnerCacheClear, Type: TypeDeletion},
+		{Kind: RunnerCacheClear, Type: TypeDeletion, Metadata: RunnerCacheClearMetadata{}},
 		{Kind: RunnerProgressReject, Type: TypeDenied, Reasons: []Reason{ReasonInvalidStatus}},
 
 		{Kind: SystemSettingsUpdate, Type: TypeChange, Metadata: SettingsMetadata{}},

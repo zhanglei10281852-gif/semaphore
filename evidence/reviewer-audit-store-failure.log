@@ -1,0 +1,5 @@
+=== RUN   TestRecord_StoreErrorIsLoggedWithTheEvent
+time="2026-10-16T08:56:44+08:00" level=error msg="Failed to store audit event" action=delete context=audit error="database is down" event_code=iam.user event_id=7b0c0000-0000-4000-8000-000000000001
+--- PASS: TestRecord_StoreErrorIsLoggedWithTheEvent (0.02s)
+PASS
+ok  	github.com/semaphoreui/semaphore/services/audit	1.939s

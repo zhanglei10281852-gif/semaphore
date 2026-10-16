@@ -6,6 +6,7 @@ import (
 
 	"github.com/Masterminds/squirrel"
 	"github.com/semaphoreui/semaphore/db"
+	"github.com/semaphoreui/semaphore/pkg/random"
 	"github.com/semaphoreui/semaphore/pkg/tz"
 )
 
@@ -117,22 +118,117 @@ func (d *SqlDb) DeleteGlobalRunner(runnerID int) (err error) {
 	return
 }
 
-func (d *SqlDb) ClearRunnerCache(runner db.Runner) (err error) {
+// maxRunnerCacheCleanupErrorLen matches the cleaning_error column length.
+const maxRunnerCacheCleanupErrorLen = 512
+
+func truncateRunnerCacheCleanupError(message string) string {
+	if len(message) <= maxRunnerCacheCleanupErrorLen {
+		return message
+	}
+	return message[:maxRunnerCacheCleanupErrorLen]
+}
+
+// runnerScopeCondition renders the project-scope guard used by every cleanup
+// update: global runners are matched by id alone, project runners also by
+// their project so a runner from another project can never touch the row.
+func runnerScopeCondition(runner db.Runner) (condition string, args []any) {
 	if runner.ProjectID == nil {
-		_, err = d.exec(
-			"update `runner` set `cleaning_requested`=? where id=?",
-			tz.Now(),
-			runner.ID)
-		return
+		return "id=? and project_id is null", []any{runner.ID}
+	}
+	return "id=? and project_id=?", []any{runner.ID, *runner.ProjectID}
+}
+
+func (d *SqlDb) RequestRunnerCacheCleanup(runner db.Runner) (requestID string, err error) {
+	requestID = random.String(32)
+	now := tz.Now()
+
+	condition, args := runnerScopeCondition(runner)
+	query := "update `runner` set `cleaning_request_id`=?, `cleaning_status`=?, " +
+		"`cleaning_error`=null, `cleaning_requested`=?, `cleaning_updated_at`=? where " + condition
+
+	updateArgs := append([]any{requestID, string(db.RunnerCacheCleanupWaiting), now, now}, args...)
+
+	res, err := d.exec(query, updateArgs...)
+	if err != nil {
+		return "", err
 	}
 
-	_, err = d.exec(
-		"update `runner` set `cleaning_requested`=? where id=? and project_id=?",
-		tz.Now(),
-		runner.ID,
-		runner.ProjectID)
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return "", err
+	}
+	if affected == 0 {
+		return "", db.ErrNotFound
+	}
 
-	return
+	return requestID, nil
+}
+
+func (d *SqlDb) ReportRunnerCacheCleanup(runner db.Runner, requestID string, status db.RunnerCacheCleanupStatus, failureReason string) (applied bool, err error) {
+	if requestID == "" || !status.Valid() {
+		return false, nil
+	}
+
+	now := tz.Now()
+	condition, args := runnerScopeCondition(runner)
+
+	var query string
+	updateArgs := make([]any, 0, 7)
+
+	switch status {
+	case db.RunnerCacheCleanupDone:
+		// A successful confirmation completes the request exactly once:
+		// rows already in "done" (e.g. a retried delivery of the same
+		// confirmation) do not match and produce no second completion.
+		query = "update `runner` set `cleaning_status`=?, `cleaning_error`=null, " +
+			"`cleaning_updated_at`=? where " + condition +
+			" and cleaning_request_id=? and cleaning_status in (?, ?, ?)"
+		updateArgs = append(updateArgs, string(status), now)
+		updateArgs = append(updateArgs, args...)
+		updateArgs = append(updateArgs, requestID,
+			string(db.RunnerCacheCleanupWaiting),
+			string(db.RunnerCacheCleanupCleaning),
+			string(db.RunnerCacheCleanupFailed))
+	case db.RunnerCacheCleanupCleaning:
+		// waiting -> cleaning, and idempotent re-reports from cleaning or
+		// failed (a new attempt after a failure reports "cleaning" again).
+		query = "update `runner` set `cleaning_status`=?, `cleaning_updated_at`=? where " +
+			condition +
+			" and cleaning_request_id=? and cleaning_status in (?, ?, ?)"
+		updateArgs = append(updateArgs, string(status), now)
+		updateArgs = append(updateArgs, args...)
+		updateArgs = append(updateArgs, requestID,
+			string(db.RunnerCacheCleanupWaiting),
+			string(db.RunnerCacheCleanupCleaning),
+			string(db.RunnerCacheCleanupFailed))
+	case db.RunnerCacheCleanupFailed:
+		query = "update `runner` set `cleaning_status`=?, `cleaning_error`=?, `cleaning_updated_at`=? where " +
+			condition +
+			" and cleaning_request_id=? and cleaning_status in (?, ?)"
+		updateArgs = append(updateArgs, string(status), truncateRunnerCacheCleanupError(failureReason), now)
+		updateArgs = append(updateArgs, args...)
+		updateArgs = append(updateArgs, requestID,
+			string(db.RunnerCacheCleanupCleaning),
+			string(db.RunnerCacheCleanupFailed))
+	case db.RunnerCacheCleanupWaiting:
+		query = "update `runner` set `cleaning_updated_at`=? where " + condition +
+			" and cleaning_request_id=? and cleaning_status=?"
+		updateArgs = append(updateArgs, now)
+		updateArgs = append(updateArgs, args...)
+		updateArgs = append(updateArgs, requestID, string(db.RunnerCacheCleanupWaiting))
+	}
+
+	res, err := d.exec(query, updateArgs...)
+	if err != nil {
+		return false, err
+	}
+
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+
+	return affected > 0, nil
 }
 
 func (d *SqlDb) TouchRunner(runner db.Runner) (err error) {

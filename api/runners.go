@@ -138,24 +138,53 @@ func (c *GlobalRunnerController) UpdateRunner(w http.ResponseWriter, r *http.Req
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// ClearRunnerCache opens a confirmable cache cleanup request for the runner.
+// It does not delete anything itself: the runner pauses task dispatch, lets
+// its in-scope jobs finish, deletes the directories and reports completion.
+// The request stays pending on the runner row until that confirmation, so the
+// response carries the request ID and the current state for the UI/API.
 func (c *GlobalRunnerController) ClearRunnerCache(w http.ResponseWriter, r *http.Request) {
 	runner := helpers.GetFromContext(r, "runner").(*db.Runner)
 
 	store := helpers.Store(r)
 
-	err := store.ClearRunnerCache(*runner)
+	requestID, err := store.RequestRunnerCacheCleanup(*runner)
 
 	if err != nil {
 		helpers.WriteError(w, err)
 		return
 	}
 
+	projectID := 0
+	if runner.ProjectID != nil {
+		projectID = *runner.ProjectID
+	}
+
 	helpers.Audit(r).Record(r.Context(), audit.Event{
-		Kind:   audit.RunnerCacheClear,
-		Target: audit.ResourceTarget(audit.TargetRunner, runner.ID, runner.Name),
+		Kind:      audit.RunnerCacheClear,
+		Target:    audit.ResourceTarget(audit.TargetRunner, runner.ID, runner.Name),
+		ProjectID: projectID,
+		Metadata: audit.RunnerCacheClearMetadata{
+			RequestID: requestID,
+			Scope:     runner.CacheCleanupScope(),
+			Phase:     "requested",
+		},
 	})
 
-	w.WriteHeader(http.StatusNoContent)
+	helpers.WriteJSON(w, http.StatusAccepted, runnerCacheCleanupResponse{
+		RequestID: requestID,
+		Status:    string(db.RunnerCacheCleanupWaiting),
+		Scope:     runner.CacheCleanupScope(),
+	})
+}
+
+// runnerCacheCleanupResponse describes the cleanup request created by a DELETE
+// .../cache call. The request remains queryable through the runner object's
+// cleaning_* fields until the runner confirms completion.
+type runnerCacheCleanupResponse struct {
+	RequestID string `json:"request_id"`
+	Status    string `json:"status"`
+	Scope     string `json:"scope"`
 }
 
 func (c *GlobalRunnerController) DeleteRunner(w http.ResponseWriter, r *http.Request) {

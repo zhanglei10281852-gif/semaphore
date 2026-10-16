@@ -18,6 +18,46 @@ const (
 	RunnerStatusOffline RunnerStatus = "offline"
 )
 
+// RunnerCacheCleanupStatus is the durable state of a runner cache cleanup
+// request. A cleanup is a confirmable, at-least-once operation: the server
+// keeps the request in one of the active states until the runner reports a
+// successful deletion carrying the matching request ID.
+type RunnerCacheCleanupStatus string
+
+const (
+	// RunnerCacheCleanupWaiting means the request was accepted but the runner
+	// still has in-scope jobs (running or queued) using the cache directories.
+	// The runner does not accept new matching jobs while in this state.
+	RunnerCacheCleanupWaiting RunnerCacheCleanupStatus = "waiting"
+	// RunnerCacheCleanupCleaning means the runner is deleting the cache
+	// directories of the request scope.
+	RunnerCacheCleanupCleaning RunnerCacheCleanupStatus = "cleaning"
+	// RunnerCacheCleanupFailed means the last deletion attempt failed. The
+	// runner keeps refusing new jobs and retries the deletion automatically.
+	RunnerCacheCleanupFailed RunnerCacheCleanupStatus = "failed"
+	// RunnerCacheCleanupDone means the runner confirmed a successful deletion
+	// for the request. It is kept on the row as the result of the latest
+	// request until a new one supersedes it.
+	RunnerCacheCleanupDone RunnerCacheCleanupStatus = "done"
+)
+
+// Valid reports whether the value is a cleanup state the API accepts.
+func (s RunnerCacheCleanupStatus) Valid() bool {
+	switch s {
+	case RunnerCacheCleanupWaiting, RunnerCacheCleanupCleaning, RunnerCacheCleanupFailed, RunnerCacheCleanupDone:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsActive reports whether a cleanup is still pending (waiting for jobs,
+// deleting, or retrying after a failure). A runner with an active cleanup is
+// excluded from task dispatch.
+func (s RunnerCacheCleanupStatus) IsActive() bool {
+	return s == RunnerCacheCleanupWaiting || s == RunnerCacheCleanupCleaning || s == RunnerCacheCleanupFailed
+}
+
 type RunnerTagFilterMode string
 
 const (
@@ -39,6 +79,18 @@ type Runner struct {
 	Tags              []string   `db:"-" json:"tags" backup:"tags"`
 	Touched           *time.Time `db:"touched" json:"touched"`
 	CleaningRequested *time.Time `db:"cleaning_requested" json:"cleaning_requested"`
+
+	// Cache cleanup request state. A DELETE .../cache request does not delete
+	// anything itself: it creates a cleanup request identified by
+	// CleaningRequestID in state RunnerCacheCleanupWaiting. The polled runner
+	// drains its in-scope jobs, performs the deletion and confirms the result
+	// with the same request ID. CleaningStatus stays active until that
+	// confirmation, so restarts and poll retries resume the request and a
+	// late confirmation of an older request cannot finish a newer one.
+	CleaningRequestID  *string                   `db:"cleaning_request_id" json:"cleaning_request_id"`
+	CleaningStatus     *string                   `db:"cleaning_status" json:"cleaning_status"`
+	CleaningError      *string                   `db:"cleaning_error" json:"cleaning_error"`
+	CleaningUpdatedAt  *time.Time                `db:"cleaning_updated_at" json:"cleaning_updated_at"`
 
 	// StartedAt is the runner process's start time, reported by the runner on
 	// every poll (X-Runner-Started-At header) and persisted next to Touched.
@@ -105,6 +157,23 @@ func (r *Runner) FillStatus(now time.Time, offlineTimeout time.Duration) {
 	} else {
 		r.Status = RunnerStatusOffline
 	}
+}
+
+// CacheCleanupActive reports whether a cleanup request is currently in
+// progress (waiting for jobs, deleting or retrying after a failure). Such a
+// runner is paused for new task dispatch.
+func (r Runner) CacheCleanupActive() bool {
+	return r.CleaningStatus != nil && RunnerCacheCleanupStatus(*r.CleaningStatus).IsActive()
+}
+
+// CacheCleanupScope returns "project" for a project runner (only its project
+// directory is deleted) and "all" for a global runner (the whole cache
+// directory is deleted, preserving the historical full-cache semantics).
+func (r Runner) CacheCleanupScope() string {
+	if r.ProjectID != nil {
+		return "project"
+	}
+	return "all"
 }
 
 type RunnerTag struct {

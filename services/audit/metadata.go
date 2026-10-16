@@ -173,3 +173,12 @@ type TaskMetadata struct {
 type RunnerRegisterMetadata struct {
 	Token string `json:"token"`
 }
+
+// RunnerCacheClearMetadata is carried by runner.cache/clear events. Phase is
+// "requested" when an admin/API opens a cleanup request and "completed" when
+// the runner has confirmed the actual deletion for the same RequestID.
+type RunnerCacheClearMetadata struct {
+	RequestID string `json:"request_id"`
+	Scope     string `json:"scope"`
+	Phase     string `json:"phase"`
+}

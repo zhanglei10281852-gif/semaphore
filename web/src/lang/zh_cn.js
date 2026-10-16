@@ -124,6 +124,10 @@ export default {
 
   clear_cache: '清除缓存',
   clear_cache_message: '删除与此项目相关的所有缓存文件。此操作不可逆。',
+  cleanup_waiting: '缓存清理等待中：等待已分配给该 Runner 的任务结束，期间不再接收新任务。',
+  cleanup_running: '正在清理缓存目录……',
+  cleanup_failed: '缓存清理失败，Runner 将保持暂停并自动重试。最近错误：',
+  cleanup_done: '缓存清理完成于',
 
   name2: '名称 *',
   title: '标题 *',

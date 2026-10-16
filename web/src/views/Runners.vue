@@ -613,7 +613,7 @@ semaphore runner start --config ./config.runner.json</pre
             <v-icon>mdi-pencil</v-icon>
           </v-btn>
 
-          <v-tooltip v-if="item.project_id != null || projectId == null" bottom :max-width="150">
+          <v-tooltip v-if="item.project_id != null || projectId == null" bottom :max-width="220">
             <template v-slot:activator="{ on, attrs }">
               <v-btn
                 v-bind="attrs"
@@ -621,7 +621,7 @@ semaphore runner start --config ./config.runner.json</pre
                 icon
                 class="mr-1"
                 @click="clearCache(item)"
-                :disabled="item.project_id == null && !isAdmin"
+                :disabled="(item.project_id == null && !isAdmin) || isCleanupActive(item)"
               >
                 <v-icon>mdi-broom</v-icon>
               </v-btn>
@@ -630,11 +630,18 @@ semaphore runner start --config ./config.runner.json</pre
               {{ $t('clear_cache') }}
             </div>
 
-            <div v-if="item.cleaning_requested" style="font-size: 12px; line-height: 1.2">
-              <span v-if="item.touched < item.cleaning_requested">
-                Already requested {{ item.cleaning_requested | formatDate }}.
-              </span>
-              <span v-else> Last cleaned {{ item.cleaning_requested | formatDate }}. </span>
+            <div v-if="runnerCleanupState(item) === 'waiting'" style="font-size: 12px; line-height: 1.2">
+              {{ $t('cleanup_waiting') }}
+            </div>
+            <div v-else-if="runnerCleanupState(item) === 'cleaning'" style="font-size: 12px; line-height: 1.2">
+              {{ $t('cleanup_running') }}
+            </div>
+            <div v-else-if="runnerCleanupState(item) === 'failed'" style="font-size: 12px; line-height: 1.2">
+              <div>{{ $t('cleanup_failed') }}</div>
+              <div v-if="item.cleaning_error" style="word-break: break-word">{{ item.cleaning_error }}</div>
+            </div>
+            <div v-else-if="runnerCleanupState(item) === 'done' && item.cleaning_updated_at" style="font-size: 12px; line-height: 1.2">
+              {{ $t('cleanup_done') }} {{ item.cleaning_updated_at | formatDate }}
             </div>
           </v-tooltip>
         </div>
@@ -672,6 +679,17 @@ export default {
     async projectId() {
       await this.loadItems();
     },
+  },
+
+  mounted() {
+    // A cache cleanup finishes asynchronously on the runner; refresh the list
+    // while any runner has a pending request so the UI walks waiting ->
+    // cleaning -> done (or failed) on its own.
+    this.cleanupRefreshTimer = setInterval(this.refreshActiveCleanups, 5000);
+  },
+
+  beforeDestroy() {
+    clearInterval(this.cleanupRefreshTimer);
   },
 
   computed: {
@@ -824,6 +842,33 @@ ${advancedOptions}-d semaphoreui/runner:${this.version}`;
     checkIntervalRule(v) {
       const n = Number(v);
       return (Number.isInteger(n) && n > 0) || this.$t('runnerCheckIntervalInvalid');
+    },
+
+    // runnerCleanupState maps the durable runner.cleaning_status to one of
+    // waiting | cleaning | failed | done, or null when no cleanup was ever
+    // requested.
+    runnerCleanupState(runner) {
+      if (!runner || !runner.cleaning_request_id) {
+        return null;
+      }
+      return runner.cleaning_status || 'waiting';
+    },
+
+    isCleanupActive(runner) {
+      const state = this.runnerCleanupState(runner);
+      return state === 'waiting' || state === 'cleaning' || state === 'failed';
+    },
+
+    async refreshActiveCleanups() {
+      if (!this.items || !this.items.some((item) => this.isCleanupActive(item))) {
+        return;
+      }
+      try {
+        await this.loadItems();
+      } catch (e) {
+        // The next interval tick retries; cleanup state is server-side and
+        // does not depend on this refresh.
+      }
     },
 
     async clearCache(runner) {

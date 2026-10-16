@@ -165,6 +165,12 @@ export default {
   clear_cache: 'Clear cache',
   clear_cache_message:
     'Delete all cache files related to this project. This action is irreversible.',
+  cleanup_waiting:
+    'Cache cleanup pending: waiting for the tasks already assigned to this runner to finish. The runner is not accepting new tasks.',
+  cleanup_running: 'Cleaning cache directories...',
+  cleanup_failed:
+    'Cache cleanup failed; the runner stays paused and retries automatically. Last error:',
+  cleanup_done: 'Cache cleanup completed at',
 
   name2: 'Name *',
   title: 'Title *',

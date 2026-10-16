@@ -1,0 +1,3 @@
+ok  	github.com/semaphoreui/semaphore/services/runners	4.105s
+ok  	github.com/semaphoreui/semaphore/api/runners	4.848s
+ok  	github.com/semaphoreui/semaphore/db/sql	4.664s

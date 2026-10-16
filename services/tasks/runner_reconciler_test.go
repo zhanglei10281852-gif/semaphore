@@ -226,6 +226,30 @@ func TestDecideRunnerTaskAction(t *testing.T) {
 			RunnerTaskKeep,
 		},
 		{
+			"starting task on runner with active cache cleanup",
+			task_logger.TaskStartingStatus, nil,
+			&db.Runner{Touched: ago(10 * time.Second), CleaningRequestID: strPtr("req-1"), CleaningStatus: cleanupStatusPtr(db.RunnerCacheCleanupWaiting)},
+			RunnerTaskRequeue,
+		},
+		{
+			"waiting task on runner cleaning cache",
+			task_logger.TaskWaitingStatus, nil,
+			&db.Runner{Touched: ago(10 * time.Second), CleaningRequestID: strPtr("req-1"), CleaningStatus: cleanupStatusPtr(db.RunnerCacheCleanupCleaning)},
+			RunnerTaskRequeue,
+		},
+		{
+			"running task stays on runner while cache cleanup waits for it",
+			task_logger.TaskRunningStatus, ago(time.Hour),
+			&db.Runner{Touched: ago(10 * time.Second), StartedAt: ago(2 * time.Hour), CleaningRequestID: strPtr("req-1"), CleaningStatus: cleanupStatusPtr(db.RunnerCacheCleanupWaiting)},
+			RunnerTaskKeep,
+		},
+		{
+			"completed cleanup does not block starting task",
+			task_logger.TaskStartingStatus, nil,
+			&db.Runner{Touched: ago(10 * time.Second), CleaningRequestID: strPtr("req-1"), CleaningStatus: cleanupStatusPtr(db.RunnerCacheCleanupDone)},
+			RunnerTaskKeep,
+		},
+		{
 			"runner deleted, starting task",
 			task_logger.TaskStartingStatus, nil,
 			nil,
@@ -342,6 +366,42 @@ func TestSelectRunner(t *testing.T) {
 	t.Run("no runners returns nil", func(t *testing.T) {
 		assert.Nil(t, selectRunner(nil, now, offlineTimeout, noBusy))
 	})
+
+	t.Run("runner with active cache cleanup skipped; other runner takes the task", func(t *testing.T) {
+		cleaningRunner := db.Runner{
+			ID:                  10,
+			Touched:             ago(10 * time.Second),
+			MaxParallelTasks:    0,
+			CleaningRequestID:   strPtr("req-1"),
+			CleaningStatus:      cleanupStatusPtr(db.RunnerCacheCleanupWaiting),
+		}
+		otherOnline := online
+		r := selectRunner([]db.Runner{cleaningRunner, otherOnline}, now, offlineTimeout, noBusy)
+		require.NotNil(t, r)
+		assert.Equal(t, otherOnline.ID, r.ID)
+
+		// Only the cleaning runner is available: no dispatch, task stays queued.
+		assert.Nil(t, selectRunner([]db.Runner{cleaningRunner}, now, offlineTimeout, noBusy))
+	})
+
+	t.Run("runner with completed cleanup selectable", func(t *testing.T) {
+		doneRunner := db.Runner{
+			ID:                11,
+			Touched:           ago(10 * time.Second),
+			CleaningRequestID: strPtr("req-1"),
+			CleaningStatus:    cleanupStatusPtr(db.RunnerCacheCleanupDone),
+		}
+		r := selectRunner([]db.Runner{doneRunner}, now, offlineTimeout, noBusy)
+		require.NotNil(t, r)
+		assert.Equal(t, doneRunner.ID, r.ID)
+	})
+}
+
+func strPtr(v string) *string { return &v }
+
+func cleanupStatusPtr(s db.RunnerCacheCleanupStatus) *string {
+	v := string(s)
+	return &v
 }
 
 func TestRequeueTaskRunnerOffline(t *testing.T) {

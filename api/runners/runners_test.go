@@ -2,10 +2,12 @@ package runners
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/semaphoreui/semaphore/api/helpers"
@@ -14,12 +16,43 @@ import (
 	"github.com/semaphoreui/semaphore/pkg/task_logger"
 	"github.com/semaphoreui/semaphore/pkg/tz"
 	"github.com/semaphoreui/semaphore/pro_interfaces"
+	"github.com/semaphoreui/semaphore/services/audit"
 	"github.com/semaphoreui/semaphore/services/runners"
 	"github.com/semaphoreui/semaphore/services/tasks"
 	"github.com/semaphoreui/semaphore/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// capturingRecorder stores audited events in memory.
+type capturingRecorder struct {
+	mu     sync.Mutex
+	events []audit.Event
+}
+
+func (c *capturingRecorder) Record(_ context.Context, event audit.Event) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.events = append(c.events, event)
+}
+
+func (c *capturingRecorder) snapshot() []audit.Event {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]audit.Event, len(c.events))
+	copy(out, c.events)
+	return out
+}
+
+func (c *capturingRecorder) completionCount() int {
+	count := 0
+	for _, e := range c.snapshot() {
+		if e.Kind == audit.RunnerCacheClear && e.Outcome == audit.OutcomeSuccess {
+			count++
+		}
+	}
+	return count
+}
 
 func TestRegisterRunner_InvalidTokenReturnsBadRequest(t *testing.T) {
 	store := sql.InitConfigCreateTestStore()
@@ -494,4 +527,178 @@ func TestUpdateRunner_SuccessWithoutOutputs(t *testing.T) {
 	assert.Empty(t, fixture.collector.validated)
 	assert.Equal(t, task_logger.TaskSuccessStatus, fixture.task.Task.Status)
 	assert.Nil(t, fixture.task.Task.Artifacts)
+}
+
+func newCleanupControllerFixture(t *testing.T) (db.Store, *tasks.TaskPool, *RunnerController) {
+	t.Helper()
+	prevCfg := util.Config
+	t.Cleanup(func() { util.Config = prevCfg })
+
+	store := sql.InitConfigCreateTestStore()
+	pool := tasks.CreateTaskPool(
+		store,
+		tasks.NewMemoryTaskStateStore(),
+		nil, nil, nil, nil, nil, nil, nil,
+	)
+	return store, &pool, NewRunnerController(store, &pool, nil, nil)
+}
+
+func TestGetRunner_CacheCleanupDirectivePausesNewJobs(t *testing.T) {
+	store, pool, ctrl := newCleanupControllerFixture(t)
+
+	runner, err := store.CreateRunner(db.Runner{Name: "cleaning", Token: "token", Active: true})
+	require.NoError(t, err)
+
+	// A waiting task already assigned to the runner must be reported as a
+	// current job (not dispatched again) while the cleanup is pending.
+	runnerID := runner.ID
+	tr := tasks.NewTaskRunner(db.Task{
+		ID:        70,
+		ProjectID: 1,
+		RunnerID:  &runnerID,
+		Status:    task_logger.TaskWaitingStatus,
+	}, pool, "", nil)
+	pool.StateStore().SetRunning(tr)
+
+	requestID, err := store.RequestRunnerCacheCleanup(runner)
+	require.NoError(t, err)
+
+	doPoll := func() runners.RunnerState {
+		fresh, err := store.GetGlobalRunner(runner.ID)
+		require.NoError(t, err)
+		req := httptest.NewRequest(http.MethodGet, "/api/internal/runners", nil)
+		req = helpers.SetContextValue(req, "store", store)
+		req = helpers.SetContextValue(req, "runner", fresh)
+		w := httptest.NewRecorder()
+		ctrl.GetRunner(w, req)
+		require.Equal(t, http.StatusOK, w.Code)
+		var state runners.RunnerState
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &state))
+		return state
+	}
+
+	state := doPoll()
+	require.NotNil(t, state.CacheCleanup)
+	assert.Equal(t, requestID, state.CacheCleanup.RequestID)
+	assert.Equal(t, runners.CacheCleanupAll, state.CacheCleanup.Scope)
+	assert.Empty(t, state.NewJobs, "paused runner must not receive new jobs")
+	require.Len(t, state.CurrentJobs, 1)
+	assert.Equal(t, 70, state.CurrentJobs[0].ID)
+
+	// Once the request is completed, no directive is sent anymore.
+	applied, err := store.ReportRunnerCacheCleanup(runner, requestID, db.RunnerCacheCleanupDone, "")
+	require.NoError(t, err)
+	require.True(t, applied)
+	pool.StateStore().DeleteRunning(tr.Task.ID)
+
+	state = doPoll()
+	assert.Nil(t, state.CacheCleanup)
+}
+
+func TestUpdateRunner_CacheCleanupConfirmations(t *testing.T) {
+	store, _, ctrl := newCleanupControllerFixture(t)
+
+	runner, err := store.CreateRunner(db.Runner{Name: "cleaning-confirm", Token: "token", Active: true})
+	require.NoError(t, err)
+
+	requestID, err := store.RequestRunnerCacheCleanup(runner)
+	require.NoError(t, err)
+
+	recorder := &capturingRecorder{}
+
+	report := func(progress *runners.CacheCleanupProgress) int {
+		req := newProgressRequest(t, store, runner, runners.RunnerProgress{CacheCleanup: progress})
+		req = helpers.SetContextValue(req, "audit", audit.Recorder(recorder))
+		w := httptest.NewRecorder()
+		ctrl.UpdateRunner(w, req)
+		return w.Code
+	}
+
+	getStatus := func() string {
+		row, err := store.GetGlobalRunner(runner.ID)
+		require.NoError(t, err)
+		if row.CleaningStatus == nil {
+			return ""
+		}
+		return *row.CleaningStatus
+	}
+
+	// waiting -> cleaning, no completion audit yet.
+	assert.Equal(t, http.StatusNoContent, report(&runners.CacheCleanupProgress{
+		RequestID: requestID,
+		Status:    db.RunnerCacheCleanupCleaning,
+	}))
+	assert.Equal(t, string(db.RunnerCacheCleanupCleaning), getStatus())
+	assert.Zero(t, recorder.completionCount())
+
+	// A failure report keeps the request active and records no completion.
+	assert.Equal(t, http.StatusNoContent, report(&runners.CacheCleanupProgress{
+		RequestID: requestID,
+		Status:    db.RunnerCacheCleanupFailed,
+		Error:     "device busy",
+	}))
+	assert.Equal(t, string(db.RunnerCacheCleanupFailed), getStatus())
+	row, err := store.GetGlobalRunner(runner.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row.CleaningError)
+	assert.Equal(t, "device busy", *row.CleaningError)
+	assert.Zero(t, recorder.completionCount())
+
+	// Retry succeeds: the request completes and exactly one success audit is
+	// recorded, carrying the matching request ID.
+	assert.Equal(t, http.StatusNoContent, report(&runners.CacheCleanupProgress{
+		RequestID: requestID,
+		Status:    db.RunnerCacheCleanupCleaning,
+	}))
+	assert.Equal(t, http.StatusNoContent, report(&runners.CacheCleanupProgress{
+		RequestID: requestID,
+		Status:    db.RunnerCacheCleanupDone,
+	}))
+	assert.Equal(t, string(db.RunnerCacheCleanupDone), getStatus())
+	assert.Equal(t, 1, recorder.completionCount())
+
+	events := recorder.snapshot()
+	require.NotEmpty(t, events)
+	last := events[len(events)-1]
+	assert.Equal(t, audit.RunnerCacheClear, last.Kind)
+	assert.Equal(t, audit.OutcomeSuccess, last.Outcome)
+	meta, ok := last.Metadata.(audit.RunnerCacheClearMetadata)
+	require.True(t, ok)
+	assert.Equal(t, requestID, meta.RequestID)
+	assert.Equal(t, "completed", meta.Phase)
+	assert.Equal(t, "all", meta.Scope)
+
+	// A duplicated delivery of the same confirmation is idempotent.
+	assert.Equal(t, http.StatusNoContent, report(&runners.CacheCleanupProgress{
+		RequestID: requestID,
+		Status:    db.RunnerCacheCleanupDone,
+	}))
+	assert.Equal(t, 1, recorder.completionCount())
+
+	// A newer request supersedes the old one: its late confirmation is ignored
+	// and the newer request stays pending.
+	newID, err := store.RequestRunnerCacheCleanup(runner)
+	require.NoError(t, err)
+	require.NotEqual(t, requestID, newID)
+	assert.Equal(t, http.StatusNoContent, report(&runners.CacheCleanupProgress{
+		RequestID: requestID,
+		Status:    db.RunnerCacheCleanupDone,
+	}))
+	assert.Equal(t, string(db.RunnerCacheCleanupWaiting), getStatus())
+	assert.Equal(t, 1, recorder.completionCount(), "stale confirmation must not complete the newer request")
+
+	// Invalid statuses are rejected without touching state.
+	assert.Equal(t, http.StatusNoContent, report(&runners.CacheCleanupProgress{
+		RequestID: newID,
+		Status:    db.RunnerCacheCleanupStatus("bogus"),
+	}))
+	assert.Equal(t, string(db.RunnerCacheCleanupWaiting), getStatus())
+
+	// The matching confirmation completes the newer request.
+	assert.Equal(t, http.StatusNoContent, report(&runners.CacheCleanupProgress{
+		RequestID: newID,
+		Status:    db.RunnerCacheCleanupDone,
+	}))
+	assert.Equal(t, string(db.RunnerCacheCleanupDone), getStatus())
+	assert.Equal(t, 2, recorder.completionCount())
 }
